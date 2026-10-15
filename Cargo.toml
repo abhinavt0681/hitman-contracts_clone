@@ -1,0 +1,19 @@
+[package]
+name = "hitman_clone"
+version = "0.1.0"
+edition = "2024"
+default-run = "hitman_clone"
+
+[dependencies]
+anyhow = "1.0.104"
+bevy = { version = "0.20", features = ["free_camera"] }
+flate2 = "1.1.10"
+texpresso = "2.0.2"
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
+
+# Parsing tens of MB of level data is slow unoptimized; keep our code debuggable but deps fast.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

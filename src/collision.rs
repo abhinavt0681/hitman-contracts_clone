@@ -1,0 +1,246 @@
+//! Static level collision: a triangle soup bucketed into a uniform XZ grid.
+//!
+//! Built from the opaque render geometry plus the level's invisible `Coli*` hulls. The real
+//! engine collision lives in `.OCT`, which isn't decoded yet; render meshes are a decent
+//! stand-in for walking around.
+
+use bevy::prelude::*;
+use std::collections::{HashMap, HashSet};
+
+const CELL: f32 = 4.0;
+
+#[derive(Resource, Default)]
+pub struct WorldCollision {
+    tris: Vec<[Vec3; 3]>,
+    /// Index of the GMS entity each triangle came from, for debugging what you bumped into.
+    source: Vec<u32>,
+    grid: HashMap<(i32, i32), Vec<u32>>,
+    disabled_sources: HashSet<u32>,
+}
+
+pub struct Hit {
+    pub distance: f32,
+    pub normal: Vec3,
+}
+
+fn cell_of(v: f32) -> i32 {
+    (v / CELL).floor() as i32
+}
+
+impl WorldCollision {
+    pub fn add_triangle(&mut self, t: [Vec3; 3], source: u32) {
+        let n = (t[1] - t[0]).cross(t[2] - t[0]);
+        if n.length_squared() < 1e-10 {
+            return;
+        }
+        let min = t[0].min(t[1]).min(t[2]);
+        let max = t[0].max(t[1]).max(t[2]);
+        // Skybox-scale triangles would land in thousands of cells; nothing walkable is that big.
+        if (max - min).max_element() > 400.0 {
+            return;
+        }
+        let id = self.tris.len() as u32;
+        self.tris.push(t);
+        self.source.push(source);
+        for x in cell_of(min.x)..=cell_of(max.x) {
+            for z in cell_of(min.z)..=cell_of(max.z) {
+                self.grid.entry((x, z)).or_default().push(id);
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tris.len()
+    }
+
+    pub fn disable_source(&mut self, source: u32) {
+        self.disabled_sources.insert(source);
+    }
+
+    pub fn enable_source(&mut self, source: u32) {
+        self.disabled_sources.remove(&source);
+    }
+
+    #[allow(dead_code)]
+    pub fn is_source_disabled(&self, source: u32) -> bool {
+        self.disabled_sources.contains(&source)
+    }
+
+    fn candidates(&self, min: Vec3, max: Vec3) -> Vec<u32> {
+        let mut out = Vec::new();
+        for x in cell_of(min.x)..=cell_of(max.x) {
+            for z in cell_of(min.z)..=cell_of(max.z) {
+                if let Some(ids) = self.grid.get(&(x, z)) {
+                    out.extend_from_slice(ids);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Source entities of wall triangles within `radius` (horizontally) of `center`.
+    pub fn walls_near(&self, center: Vec3, radius: f32) -> Vec<u32> {
+        let r = Vec3::splat(radius);
+        let mut out: Vec<u32> = self
+            .candidates(center - r, center + r)
+            .into_iter()
+            .filter(|&id| {
+                if self.disabled_sources.contains(&self.source[id as usize]) {
+                    return false;
+                }
+                let [a, b, c] = self.tris[id as usize];
+                let p = closest_point_on_triangle(center, a, b, c);
+                let diff = center - p;
+                let dy = diff.y.abs();
+                if dy >= radius {
+                    return false;
+                }
+                let r_slice = (radius * radius - dy * dy).sqrt();
+                let mut d = diff;
+                d.y = 0.0;
+                (b - a).cross(c - a).normalize().y.abs() <= 0.7 && d.length() < r_slice
+            })
+            .map(|id| self.source[id as usize])
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Nearest spot to `feet` (searching outward in rings up to `max_radius`) with a floor
+    /// within a meter and no walls within `clearance` at knee and chest height.
+    pub fn free_spot(&self, feet: Vec3, clearance: f32, max_radius: f32) -> Option<Vec3> {
+        let try_at = |p: Vec3| -> Option<Vec3> {
+            let hit = self.raycast(p + Vec3::Y * 1.0, Vec3::NEG_Y, 2.0)?;
+            let floor = p + Vec3::Y * (1.0 - hit.distance);
+            let blocked = [0.75, 1.5].iter().any(|h| !self.walls_near(floor + Vec3::Y * h, clearance).is_empty());
+            (hit.normal.y > 0.7 && !blocked).then_some(floor)
+        };
+        let step = 0.25;
+        for ring in 0..=(max_radius / step) as i32 {
+            let r = ring as f32 * step;
+            let samples = (ring * 8).max(1);
+            for k in 0..samples {
+                let a = k as f32 / samples as f32 * std::f32::consts::TAU;
+                if let Some(p) = try_at(feet + Vec3::new(a.cos() * r, 0.0, a.sin() * r)) {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    /// Nearest hit along a ray segment (both faces count).
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<Hit> {
+        let dir = dir.normalize_or_zero();
+        let end = origin + dir * max_dist;
+        let mut best: Option<Hit> = None;
+        for id in self.candidates(origin.min(end), origin.max(end)) {
+            if self.disabled_sources.contains(&self.source[id as usize]) {
+                continue;
+            }
+            let [a, b, c] = self.tris[id as usize];
+            // Möller–Trumbore
+            let (e1, e2) = (b - a, c - a);
+            let p = dir.cross(e2);
+            let det = e1.dot(p);
+            if det.abs() < 1e-8 {
+                continue;
+            }
+            let inv = 1.0 / det;
+            let s = origin - a;
+            let u = s.dot(p) * inv;
+            if !(0.0..=1.0).contains(&u) {
+                continue;
+            }
+            let q = s.cross(e1);
+            let v = dir.dot(q) * inv;
+            if v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+            let t = e2.dot(q) * inv;
+            if t >= 0.0 && t <= max_dist && best.as_ref().is_none_or(|h| t < h.distance) {
+                let mut normal = e1.cross(e2).normalize();
+                if normal.dot(dir) > 0.0 {
+                    normal = -normal;
+                }
+                best = Some(Hit { distance: t, normal });
+            }
+        }
+        best
+    }
+
+    /// Horizontal push that moves a sphere out of walls. Floor-like faces are ignored so
+    /// the sphere doesn't get lifted by the ground it stands on.
+    pub fn push_out_horizontal(&self, center: Vec3, radius: f32) -> Vec3 {
+        let mut push = Vec3::ZERO;
+        let r = Vec3::splat(radius);
+        for id in self.candidates(center - r, center + r) {
+            if self.disabled_sources.contains(&self.source[id as usize]) {
+                continue;
+            }
+            let [a, b, c] = self.tris[id as usize];
+            let n = (b - a).cross(c - a).normalize();
+            if n.y.abs() > 0.7 {
+                continue;
+            }
+            let p = closest_point_on_triangle(center + push, a, b, c);
+            let diff = center + push - p;
+            let dy = diff.y.abs();
+            if dy >= radius {
+                continue;
+            }
+            let r_slice = (radius * radius - dy * dy).sqrt();
+            let mut d = diff;
+            d.y = 0.0;
+            let len = d.length();
+            if len < r_slice {
+                if len > 1e-5 {
+                    push += d / len * (r_slice - len);
+                } else {
+                    let n_horiz = Vec3::new(n.x, 0.0, n.z);
+                    let n_len = n_horiz.length();
+                    if n_len > 1e-5 {
+                        push += (n_horiz / n_len) * r_slice;
+                    }
+                }
+            }
+        }
+        push
+    }
+}
+
+/// Real-Time Collision Detection (Ericson), 5.1.5.
+fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let (ab, ac, ap) = (b - a, c - a, p - a);
+    let (d1, d2) = (ab.dot(ap), ac.dot(ap));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = p - b;
+    let (d3, d4) = (ab.dot(bp), ac.dot(bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return a + ab * (d1 / (d1 - d3));
+    }
+    let cp = p - c;
+    let (d5, d6) = (ab.dot(cp), ac.dot(cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return a + ac * (d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let denom = 1.0 / (va + vb + vc);
+    a + ab * (vb * denom) + ac * (vc * denom)
+}
