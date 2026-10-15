@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 const CELL: f32 = 4.0;
 
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone)]
 pub struct WorldCollision {
     tris: Vec<[Vec3; 3]>,
     /// Index of the GMS entity each triangle came from, for debugging what you bumped into.
@@ -51,6 +51,45 @@ impl WorldCollision {
 
     pub fn len(&self) -> usize {
         self.tris.len()
+    }
+
+    /// Height of the highest surface over each cell of a `w`×`h` grid (cell centres at
+    /// `origin + (i + 0.5) * cell`), or `f32::MIN` where nothing is overhead: a top-down depth
+    /// map of the level, used to keep snow out from under roofs.
+    pub fn top_heights(&self, origin: Vec2, cell: f32, w: usize, h: usize) -> Vec<f32> {
+        let mut top = vec![f32::MIN; w * h];
+        for t in &self.tris {
+            let min = t[0].min(t[1]).min(t[2]).xz();
+            let max = t[0].max(t[1]).max(t[2]).xz();
+            let lo = ((min - origin) / cell - 0.5).ceil().as_ivec2().max(IVec2::ZERO);
+            let hi = ((max - origin) / cell - 0.5).floor().as_ivec2().min(IVec2::new(w as i32 - 1, h as i32 - 1));
+            let (a, b, c) = (t[0].xz(), t[1].xz(), t[2].xz());
+            let area = (b - a).perp_dot(c - a);
+            if area.abs() < 1e-8 {
+                continue;
+            }
+            for z in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let p = origin + (Vec2::new(x as f32, z as f32) + 0.5) * cell;
+                    // Barycentric test and height interpolation.
+                    let w0 = (b - p).perp_dot(c - p) / area;
+                    let w1 = (c - p).perp_dot(a - p) / area;
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
+                        continue;
+                    }
+                    let y = w0 * t[0].y + w1 * t[1].y + w2 * t[2].y;
+                    let slot = &mut top[z as usize * w + x as usize];
+                    *slot = slot.max(y);
+                }
+            }
+        }
+        top
+    }
+
+    /// World-space bounds of all triangles.
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        self.tris.iter().flatten().fold((Vec3::MAX, Vec3::MIN), |(a, b), v| (a.min(*v), b.max(*v)))
     }
 
     pub fn disable_source(&mut self, source: u32) {

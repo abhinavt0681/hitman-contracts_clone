@@ -107,29 +107,67 @@ model hangs off the `Hitman2` template.
 - Composition is standard: `world_q = parent_q · q`, `world_p = parent_p + rotate(parent_q, p)`.
   Same X/Z swap as static meshes: positions → `swap_xz`, quaternions → (−z, −y, −x, w).
 
-## ANM: animations (partial)
+## ANM: animations
 
-- `"ANM\0"` magic (stored reversed), `u32 size|0x80000000, u32 size`, then per animation set a
-  node `{u32 0x0A, u32 size|flag, u32 size, u32 1, u32 count, u32 count*4, count × ptr}` followed by
-  the set's path (`Worlds\Characters\_Anims\Hero\Hero.anm`, `Reg_Male`, `Bjarkov`, …).
-- Rotation keys are 4 signed bytes (x, y, z, w ÷ 127). Tracks are contiguous streams of variable
-  length (6–9 keys seen for a 28-frame animation), so key times live elsewhere.
-- Near the end: packed strings, first bone names prefixed with their channel id byte, then
-  animation names in alphabetical order (`Change_Clothes`, `Drag_Ambient`, …, `Walk_Left`). Then
-  a graph of small `u16 type, u16 size` records with relative offsets, animation nodes
-  `{u32 id, u16 0x87, u16 frames, u32 track_count, ptrs}`, and 40-byte descriptors at the very end.
-  Not yet decoded far enough to play back; characters currently use a procedural gait.
+Recovered from `ZAnimFilePack` in `HitmanContracts.exe` (vtable 0x72D0C4, loader 0x61C0A0, sampler
+0x61B930); `src/glacier/anm.rs` is the reference implementation.
 
-## GMS: actor properties (partial)
+- A tree of chunks: `u32 type, u32 size|flags`. Bit 31 = container (child count at +0xC, children
+  at +0x10, or after an index table when bit 30 is set); with a top bit set the payload is at
+  `chunk + [chunk+8]`, else at `chunk + 8`. The root has type `"ANM\0"`.
+- Root children: one `0x0A` per animation set (payload = set path such as
+  `Worlds\Characters\_Anims\Hero\Hero.anm`; its first child is `u32 count` + offsets of animation
+  records), `0x04` strings, `0x05` animation records and tracks, `0x06` bit-packed key tables,
+  `0x07` rotation keys, `0x08` position keys, `0x0B` static positions (f32×3), `0x0D` static
+  rotations (f32×4).
+- Animation record (40 B, in chunk 5): `+0x14` track table offset, `+0x24` name offset (chunk 4).
+  Track table: `u32 n` + n offsets (from the start of chunk 5) of tracks.
+- Track: `u16 bone_name` (chunk 4; the byte before the name is the bone's channel id), `u16 0`,
+  `u16 static_pos`, `u16 static_rot`, `u16 frames`, `u16 flags` (0x1 rotations as 4×i16 ÷ 32512,
+  0x2 as 4×i8 ÷ 127, 0x4 keyed positions, 0x8 static position, 0x10 static rotation); unless 0x10,
+  `u32 keys, u32 frame_to_key, u32 key_to_frame`; if 0x4 without 0x8, the same for positions.
+- Key tables: `i8` bit width, then MSB-first packed values. Key k is at frame
+  `k == 0 ? 0 : key_to_frame[k-1]`; the last key is at `frames`. 30 frames per second.
+- Rotations replace the bone's local rotation; positions its local translation. The GROUND track
+  carries root motion (Walk_Forward covers 1.54 m/s). Death clips end lying down only when that
+  root motion is applied.
+- C02-1 holds 7 sets / 528 animations: Hero (47, 228), Reg_Male (257), Worker_C2-1, FabianFuchs,
+  Chef_C2-1, Bjarkov, Bomb_Builder.
 
-Actor records carry a property blob after the usual fields: the animation set path, the actor's
-name, its script (`scripts\C02-1\SoldierPatrol.sdl`), the declaration string (`LONG
-m_iHitpoints=20;…;ZGEOMREF WayPoints;…`), then values. The encoding isn't Blood Money's PRP
-bytecode; reference values (`0x19F208`, …) aren't plain entity offsets.
+## GMS: actor properties and paths
+
+- Actor records carry, after `+0x20`: the animation set path, the actor name, the script
+  (`scripts\C02-1\SoldierPatrol.sdl`), a declaration string (`LONG m_iHitpoints=20;…;ZGEOMREF
+  WayPoints;…`), then one tagged value per declared field: tag `3` i32, `2` f32, `8` entity
+  reference, `4`/`0x84`/`0x85` NUL-terminated string.
+- **Entity references are `0x80000000 | (index + 1)`**: 1-based indices into the entity table, 0 =
+  none. (Read 0-based, every reference lands one entity late: `WeaponTemplate` → `Slide` instead
+  of `Rifle_AK47_01`.)
+- Paths (class `0x080000C8`, e.g. `SoldierPatrol_01`) point from `+0x20` at a node list:
+  `u32 size, u32 header, u8 0`, then `(size − 22) / 4` references in walking order, then a 13-byte
+  trailer. Nodes are ordinary entities (`Arrow#03`, `07_walk`, `16_Wait_hanginbar`); a guard's
+  `WayPoints` refers to its path. All 11 patrols in C02-1 resolve this way.
+- Light entities (`0x800023` spot, `0x800024` omni) carry only a position; their shared property
+  blob is empty, so colour and radius must come from elsewhere (not found yet).
+- Mission anchors are named entities: `Box_01..03` (bomb triggers on the sub's deck, under the
+  `bombicon_*` map icons), `SubRadiactionBox` (sic), `RadiationWarning`, `Exitbox`, `TNT_*`,
+  `cb_BombWorker_01` (radiation suit). The cargo plane's lights: `RedTailLight`, `RedFrontLight`,
+  `RedPosLight`, `TailStrobeLight`, `LeftStrobeLight`, `RightStrobeLight`.
+
+## WHD / WAV / streams.wav: sound
+
+- `<ID>_MAIN.WHD` indexes `<ID>_MAIN.WAV`: from 0x10, records of a NUL-terminated name padded to
+  4 bytes plus 48 bytes of metadata (`+8` format tag, `+12` sample rate, `+16` bits, `+20`
+  decoded size, `+24` stored size, `+28` channels, `+32` data offset, `+40` block align).
+- Sound effects and dialogue are mono IMA ADPCM; music lives in the global `streams.wav` as Ogg
+  Vorbis (format tag bit 31; the decoder also treats offsets beyond the WAV as streamed).
+- C02-1 has 1530 entries. Dialogue names follow `C02-1_<scene>_<line><speaker>` and the LOC file
+  maps them to subtitles (`C02-1_BGHM_01CB` = "So good to meet you at last Fabian…"); the base PA
+  is `02-1_LS_01..09` (news, weather, the intruder alarm).
 
 ## Not yet decoded
 
 - `OCT`: collision octree (quantized; origin + 0.49 scale in the header). The clone currently
   collides against render meshes, collision proxies and `Coli*` hulls instead.
-- `ANM` playback (see above), `AMS`, `SND`/`WAV`/`WHD` audio, `ZGF`/`SGP`/`RMC`/`RMI`/`SUP`,
-  actor property values (patrol waypoints, sentry flags).
+- `AMS`, `SND`, `ZGF`/`SGP`/`RMC`/`RMI`/`SUP`, light colour/radius, and the `.sdl` scripts that
+  drive AI and cutscenes.

@@ -33,10 +33,73 @@ fn main() -> Result<()> {
     }
     println!("{id}: {} entities, {} PRM records, {meshes} mesh instances ({tris} tris), {bad} failed", level.entities.len(), level.prm.len());
     let with_props = level.entities.iter().filter(|e| e.props.is_some()).count();
-    let with_waypoints = level.entities.iter().filter(|e| e.props.as_ref().is_some_and(|p| p.waypoints > 0)).count();
+    let with_waypoints = level.entities.iter().filter(|e| e.props.as_ref().is_some_and(|p| p.waypoints.is_some())).count();
     println!("  entities with script properties: {with_props}, with waypoints: {with_waypoints}");
     for (t, n) in by_type.iter().filter(|(_, n)| **n > 50) {
         println!("  type {t:#08x}: {n}");
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--paths") {
+        for name in args.iter().skip(i + 1) {
+            for (idx, e) in level.entities.iter().enumerate().filter(|(_, e)| &e.name == name) {
+                let wp = e.props.as_ref().and_then(|p| p.waypoints);
+                println!("  [{idx}] {} type {:#x} path {:?} waypoints-ref {:?}", e.name, e.type_id, e.path, wp);
+                if let Some(w) = wp {
+                    let g = &level.entities[w];
+                    println!("     -> [{w}] {} nodes {:?}", g.name, g.path.iter().map(|&n| &level.entities[n].name).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    if args.iter().any(|a| a == "--coplanar") {
+        // Flat horizontal parts in world space (cm): (height mm, xz bounds, entity, texture, lod).
+        let mut flats: Vec<(i64, [f32; 4], usize, u32, u8, bool)> = Vec::new();
+        for (i, e) in level.entities.iter().enumerate() {
+            if e.type_id != 0x200002 || !level.prm.is_record(e.primitive) {
+                continue;
+            }
+            let Ok(m) = level.prm.model(e.primitive) else { continue };
+            for sm in m.submeshes.iter().filter(|s| s.in_lod0() && s.texture != 0) {
+                let ys: Vec<f32> = sm.vertices.iter().map(|v| v.pos[1]).collect();
+                let (ylo, yhi) = ys.iter().fold((f32::MAX, f32::MIN), |(a, b), &y| (a.min(y), b.max(y)));
+                if yhi - ylo > 0.5 || sm.vertices.len() < 3 {
+                    continue;
+                }
+                // World xz via the entity's row-vector matrix, with the PRM x/z swap.
+                let r = e.rotation;
+                let (mut x0, mut x1, mut z0, mut z1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                for v in &sm.vertices {
+                    let q = [v.pos[2], v.pos[1], v.pos[0]];
+                    let wx = q[0] * r[0][0] + q[1] * r[1][0] + q[2] * r[2][0] + e.position[0];
+                    let wz = q[0] * r[0][2] + q[1] * r[1][2] + q[2] * r[2][2] + e.position[2];
+                    x0 = x0.min(wx); x1 = x1.max(wx); z0 = z0.min(wz); z1 = z1.max(wz);
+                }
+                let wy = ylo + e.position[1];
+                flats.push(((wy * 10.0).round() as i64, [x0, x1, z0, z1], i, sm.texture, sm.lod_mask, sm.blended));
+            }
+        }
+        flats.sort_by_key(|f| f.0);
+        let mut pairs = std::collections::BTreeMap::new();
+        for (a, fa) in flats.iter().enumerate() {
+            for fb in flats[a + 1..].iter().take_while(|fb| fb.0 == fa.0) {
+                if fa.2 == fb.2 {
+                    continue;
+                }
+                let (p, q) = (fa.1, fb.1);
+                let ox = p[1].min(q[1]) - p[0].max(q[0]);
+                let oz = p[3].min(q[3]) - p[2].max(q[2]);
+                if ox > 50.0 && oz > 50.0 {
+                    let key = (strip(&level.entities[fa.2].name), fa.3, fa.5, strip(&level.entities[fb.2].name), fb.3, fb.5);
+                    *pairs.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut v: Vec<_> = pairs.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for ((na, ta, ba, nb, tb, bb), n) in v.iter().take(25) {
+            println!("  {n:4}x  {na}[tex {ta}{}]  vs  {nb}[tex {tb}{}]", if *ba { " blend" } else { "" }, if *bb { " blend" } else { "" });
+        }
     }
 
     if args.iter().any(|a| a == "--types") {
@@ -145,20 +208,6 @@ fn main() -> Result<()> {
         }
     }
 
-    if let Ok(m) = level.prm.model(0x4d23e) {
-        println!("Model 0x4d23e bbox_min={:?} bbox_max={:?} submeshes={}", m.bbox_min, m.bbox_max, m.submeshes.len());
-        for (i, sm) in m.submeshes.iter().enumerate() {
-            let (mut min_v, mut max_v) = ([f32::MAX; 3], [f32::MIN; 3]);
-            for v in &sm.vertices {
-                for k in 0..3 {
-                    min_v[k] = min_v[k].min(v.pos[k]);
-                    max_v[k] = max_v[k].max(v.pos[k]);
-                }
-            }
-            println!("  submesh {i}: tex={} verts={} min={min_v:?} max={max_v:?}", sm.texture, sm.vertices.len());
-        }
-    }
-
     if args.iter().any(|a| a == "--tree") {
         #[allow(dead_code)]
         struct Frame {
@@ -244,9 +293,35 @@ fn main() -> Result<()> {
             if filter.is_empty() || e.name.to_lowercase().contains(&filter.to_lowercase()) {
                 println!("  [{idx:4}] {:<32} type={:#08x} pos=({:.2}, {:.2}, {:.2}) prm=0x{:x}",
                     e.name, e.type_id, e.position[0], e.position[1], e.position[2], e.primitive);
+                if let Some(c) = &e.cloth {
+                    println!("         cloth: anchors {:?}, wind {:?}", c.anchors, c.wind);
+                }
             }
         }
     }
+    if let Some(i) = args.iter().position(|a| a == "--sounds") {
+        let pat = args.get(i + 1).map_or("", String::as_str).to_ascii_lowercase();
+        let dir = Path::new("data/Scenes").join(id);
+        let archive = hitman_clone::glacier::audio::AudioArchive::load(&dir.join(format!("{id}_MAIN.WHD")), &dir.join(format!("{id}_MAIN.WAV")), Path::new("data/streams.wav"))?;
+        let mut names: Vec<_> = archive.entries.keys().filter(|n| n.to_ascii_lowercase().contains(&pat)).collect();
+        names.sort();
+        println!("  {} entries, {} matching", archive.entries.len(), names.len());
+        for n in &names {
+            println!("  {n}");
+        }
+        // `--sounds PATTERN --export DIR` writes the matching sounds out, decoded.
+        if let Some(j) = args.iter().position(|a| a == "--export") {
+            let out = Path::new(&args[j + 1]);
+            std::fs::create_dir_all(out)?;
+            for n in names {
+                if let Some(bytes) = archive.decode(n) {
+                    let ext = if bytes.starts_with(b"OggS") { "ogg" } else { "wav" };
+                    std::fs::write(out.join(format!("{}.{ext}", n.trim_end_matches(".wav"))), bytes)?;
+                }
+            }
+        }
+    }
+
     if args.iter().any(|a| a == "--test-audio") {
         let whd_path = Path::new("data/Scenes/C02-1/C02-1_MAIN.WHD");
         let wav_path = Path::new("data/Scenes/C02-1/C02-1_MAIN.WAV");
@@ -261,4 +336,9 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Entity name without its instance suffix (`Ground_20x14_03_63` → `Ground_20x14`).
+fn strip(n: &str) -> String {
+    n.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_' || c == '#').to_owned()
 }

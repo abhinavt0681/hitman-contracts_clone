@@ -11,6 +11,8 @@ pub struct Level {
     pub tex: TexArchive,
     pub anm: AnmFile,
     pub strings: Strings,
+    /// The `.SND` table: sound records that emitters and scripts refer to by offset.
+    pub snd: Vec<u8>,
 }
 
 impl Level {
@@ -29,6 +31,16 @@ impl Level {
         let entities = gms::parse_entities(&body, &read("BUF")?)?;
         let anm = AnmFile::parse(&read("ANM")?).context("parsing ANM")?;
         let strings = Strings::parse(&read("LOC")?);
-        Ok(Self { id: id.to_owned(), entities, prm: PrmArchive::parse(read("PRM")?)?, tex: TexArchive::parse(read("TEX")?)?, anm, strings })
+        let snd = read("SND").unwrap_or_default();
+        Ok(Self { id: id.to_owned(), entities, prm: PrmArchive::parse(read("PRM")?)?, tex: TexArchive::parse(read("TEX")?)?, anm, strings, snd })
+    }
+
+    /// Name of the sound whose `.SND` record starts at `offset` (records hold a pointer to
+    /// their name at +4), as the sound bank knows it.
+    pub fn sound_name(&self, offset: u32) -> Option<&str> {
+        let at = offset as usize;
+        let name_at = u32::from_le_bytes(self.snd.get(at + 4..at + 8)?.try_into().ok()?) as usize;
+        let end = self.snd.get(name_at..)?.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(&self.snd[name_at..name_at + end]).ok()
     }
 }

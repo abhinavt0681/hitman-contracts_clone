@@ -270,7 +270,13 @@ fn sample_pose(rig: &Rig, clip: &Animation, time: f32, looping: bool) -> Vec<(Op
     pose
 }
 
-fn animate(time: Res<Time>, lib: Option<Res<AnimLibrary>>, mut rigs: Query<(&Rig, &mut Animator)>, mut joints: Query<&mut Transform>) {
+fn animate(
+    time: Res<Time>,
+    lib: Option<Res<AnimLibrary>>,
+    mut missing: Local<std::collections::HashSet<String>>,
+    mut rigs: Query<(&Rig, &mut Animator)>,
+    mut joints: Query<&mut Transform>,
+) {
     let Some(lib) = lib else { return };
     if std::env::var_os("HITMAN_NO_ANIM").is_some() {
         return; // debug: show bind poses
@@ -279,7 +285,14 @@ fn animate(time: Res<Time>, lib: Option<Res<AnimLibrary>>, mut rigs: Query<(&Rig
     for (rig, mut anim) in &mut rigs {
         let set = anim.set;
         anim.current.time += dt * anim.current.rate;
-        let Some(clip) = lib.clip(set, &anim.current.clip) else { continue };
+        let Some(clip) = lib.clip(set, &anim.current.clip) else {
+            // A bad clip name must never lock a character: report it once and release.
+            if missing.insert(anim.current.clip.clone()) {
+                warn!("animation clip {:?} not found in set {set}", anim.current.clip);
+            }
+            anim.busy = 0.0;
+            continue;
+        };
         anim.busy = if anim.current.looping { 0.0 } else { (clip.duration() - anim.current.time).max(0.0) / anim.current.rate.max(0.01) };
         let mut pose = sample_pose(rig, clip, anim.current.time, anim.current.looping);
 

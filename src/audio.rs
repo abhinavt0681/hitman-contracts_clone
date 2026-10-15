@@ -7,7 +7,11 @@ use bevy::{
 
 #[derive(Resource)]
 pub struct SoundBank {
-    pub ambient_music: Handle<AudioSource>,
+    /// Jesper Kyd's score, one loop per `music::Cue`.
+    pub music: [Handle<AudioSource>; crate::music::CUES],
+    pub wind: Handle<AudioSource>,
+    pub fog_horn: Handle<AudioSource>,
+    pub announcements: [Handle<AudioSource>; 5],
     pub door_wood_open: Handle<AudioSource>,
     pub door_wood_close: Handle<AudioSource>,
     pub door_metal_open: Handle<AudioSource>,
@@ -31,7 +35,14 @@ pub struct SoundBank {
     pub bjarkhov_welcome: Handle<AudioSource>,
     pub bjarkhov_drink_vodka: Handle<AudioSource>,
     pub base_alarm: Handle<AudioSource>,
+    /// What the level's sound emitters play, by bank name (`ambience::VOICES`).
+    pub ambient: std::collections::HashMap<&'static str, Handle<AudioSource>>,
 }
+
+/// The blizzard's looping wind, swelling with gusts (`atmosphere::Gust`).
+#[derive(Component)]
+pub struct WindLoop;
+pub const WIND_VOLUME: f32 = 0.45;
 
 pub fn play_sound(commands: &mut Commands, handle: &Handle<AudioSource>, volume: f32) {
     commands.spawn((
@@ -40,24 +51,36 @@ pub fn play_sound(commands: &mut Commands, handle: &Handle<AudioSource>, volume:
     ));
 }
 
+/// Decodes every sound straight from the level's own bank (`<ID>_MAIN.WHD/WAV`, music from
+/// `streams.wav`), by the names the game uses. Missing entries are reported and play silence.
 pub fn setup_audio(mut commands: Commands, mut audio_assets: ResMut<Assets<AudioSource>>) {
-    let mut load = |name: &str| -> Handle<AudioSource> {
-        let path = format!("data/audio/{name}.ogg");
-        match std::fs::read(&path) {
-            Ok(bytes) => audio_assets.add(AudioSource {
-                bytes: bytes.into(),
-            }),
-            Err(err) => {
-                warn!("Failed to load audio {path}: {err}");
-                audio_assets.add(AudioSource {
-                    bytes: vec![].into(),
-                })
-            }
+    let id = std::env::args().nth(1).unwrap_or_else(|| "C02-1".to_owned());
+    let dir = std::path::Path::new("data/Scenes").join(&id);
+    let archive = match hitman_clone::glacier::audio::AudioArchive::load(
+        &dir.join(format!("{id}_MAIN.WHD")),
+        &dir.join(format!("{id}_MAIN.WAV")),
+        std::path::Path::new("data/streams.wav"),
+    ) {
+        Ok(a) => Some(a),
+        Err(err) => {
+            warn!("no sound bank for {id}: {err:#}");
+            None
         }
     };
-
+    let mut load = |name: &str| -> Handle<AudioSource> {
+        let bytes = archive.as_ref().and_then(|a| a.decode(&format!("{name}.wav"))).unwrap_or_else(|| {
+            warn!("sound {name} not found in the {id} bank");
+            Vec::new()
+        });
+        audio_assets.add(AudioSource { bytes: bytes.into() })
+    };
     let bank = SoundBank {
-        ambient_music: load("Music_Winter&Night"),
+        music: crate::music::TRACKS.map(&mut load),
+        wind: load("Wind_Snow_01"),
+        fog_horn: load("Ship_FogHorn_01"),
+        // The base PA: news, weather ("Snow squalls continuing…"), notices.
+        announcements: ["02-1_LS_01Announcement", "02-1_LS_02Announcement", "02-1_LS_03Announcement", "02-1_LS_06Announcement", "02-1_LS_08Advertisement"]
+            .map(&mut load),
         door_wood_open: load("Door_WoodOpen_01"),
         door_wood_close: load("Door_WoodClosed_01"),
         door_metal_open: load("Door_MetalOpen_01"),
@@ -69,25 +92,49 @@ pub fn setup_audio(mut commands: Commands, mut audio_assets: ResMut<Assets<Audio
         gun_holster: load("Gun_Holster_01"),
         fuchs_want_soup: load("02-1_FOS_01Fuchs"),
         fuchs_poisoned: load("02-1_FS_01Fuchs"),
-        step_snow: [load("Step_Snow_01"), load("Step_Snow_02"), load("Step_Snow_03")],
-        step_steel: [load("Step_Steel_01"), load("Step_Steel_02")],
-        clothes_touch: load("Clothes_Touch"),
-        body_drag: load("Body_Drag"),
-        body_drop: load("Body_Drop"),
-        osd_hint: load("OSD_Hint"),
-        osd_warning: load("OSD_Warning"),
-        key_pick_lock: load("Key_PickLock"),
-        bjarkhov_welcome: load("Bjarkhov_Welcome"),
-        bjarkhov_drink_vodka: load("Bjarkhov_DrinkVodka"),
-        base_alarm: load("Base_Alarm"),
+        step_snow: ["Step_SnowNew_01", "Step_SnowNew_02", "Step_SnowNew_03"].map(&mut load),
+        step_steel: ["Step_Steel_01", "Step_Steel_02"].map(&mut load),
+        clothes_touch: load("Clothes_NormalTouch_01"),
+        body_drag: load("Body_Drag_01"),
+        body_drop: load("Drop_BodySnow_01"),
+        osd_hint: load("OSD_Ingame_Hint_01"),
+        osd_warning: load("OSD_Ingame_Warning_01"),
+        key_pick_lock: load("Key_PickLock_01"),
+        // "So good to meet you at last Fabian… We shall have some vodka."
+        bjarkhov_welcome: load("C02-1_BGHM_01CB"),
+        // "Nostrovya!"
+        bjarkhov_drink_vodka: load("C02-1_B_01CB"),
+        // "Alarm. Get to your posts. We have an intruder. Alarm."
+        base_alarm: load("02-1_LS_09Alarm"),
+        ambient: crate::ambience::VOICES.iter().map(|v| (v.sound, load(v.sound))).collect(),
     };
 
-    // Spawn ambient Siberia soundtrack looping
-    commands.spawn((
-        AudioPlayer::new(bank.ambient_music.clone()),
-        PlaybackSettings::LOOP.with_volume(Volume::Linear(0.30)),
-    ));
-
+    // The blizzard never stops.
+    commands.spawn((AudioPlayer::new(bank.wind.clone()), PlaybackSettings::LOOP.with_volume(Volume::Linear(WIND_VOLUME)), WindLoop));
     commands.insert_resource(bank);
-    info!("Glacier audio bank initialized with authentic Contracts sound effects and ambient soundtrack");
+    commands.insert_resource(Ambience { next_pa: 40.0, next_horn: 25.0, pa_index: 0 });
+}
+
+/// Timers for the base's background life: PA announcements and the icebreaker's fog horn.
+#[derive(Resource)]
+pub struct Ambience {
+    next_pa: f32,
+    next_horn: f32,
+    pa_index: usize,
+}
+
+pub fn ambience(mut commands: Commands, time: Res<Time>, bank: Option<Res<SoundBank>>, mut amb: Option<ResMut<Ambience>>) {
+    let (Some(bank), Some(amb)) = (bank, amb.as_mut()) else { return };
+    let dt = time.delta_secs();
+    amb.next_pa -= dt;
+    amb.next_horn -= dt;
+    if amb.next_pa <= 0.0 {
+        play_sound(&mut commands, &bank.announcements[amb.pa_index % bank.announcements.len()], 0.35);
+        amb.pa_index += 1;
+        amb.next_pa = 75.0;
+    }
+    if amb.next_horn <= 0.0 {
+        play_sound(&mut commands, &bank.fog_horn, 0.25);
+        amb.next_horn = 55.0;
+    }
 }

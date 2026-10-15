@@ -8,18 +8,23 @@
 //! F1 toggles the debug fly camera: right mouse / M to capture, WASD + E/Q, Shift fast,
 //! scroll for speed.
 
+mod ambience;
+mod atmosphere;
 mod audio;
 mod character;
+mod cloth;
 mod collision;
 mod game;
 mod hud;
+mod music;
+mod nav;
 mod player;
 mod shot;
+mod snow;
 mod view;
 
 use bevy::{
     camera_controller::free_camera::FreeCameraPlugin,
-    pbr::{DistanceFog, FogFalloff},
     prelude::*,
 };
 use hitman_clone::glacier;
@@ -29,15 +34,15 @@ const DEFAULT_LEVEL: &str = "C02-1";
 
 fn main() {
     App::new()
-        .insert_resource(ClearColor(Color::srgb(0.62, 0.67, 0.74)))
-        .insert_resource(GlobalAmbientLight { color: Color::srgb(0.85, 0.9, 1.0), brightness: 600.0, ..default() })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window { title: "Hitman Contracts clone — The Bjarkhov Bomb".into(), ..default() }),
             ..default()
         }))
+        .add_plugins((atmosphere::AtmospherePlugin, ambience::AmbiencePlugin, snow::SnowPlugin, cloth::ClothPlugin, nav::NavPlugin, music::MusicPlugin))
         .add_plugins((FreeCameraPlugin, player::PlayerPlugin, character::CharacterPlugin, game::GamePlugin, hud::HudPlugin, shot::ShotPlugin))
         .init_resource::<collision::WorldCollision>()
         .add_systems(Startup, (load_level, audio::setup_audio))
+        .add_systems(Update, audio::ambience)
         .run();
 }
 
@@ -112,18 +117,11 @@ fn load_level(
         Camera3d::default(),
         Transform::from_translation(start + Vec3::new(0.0, 2.0, 3.0)),
         player::orbit_camera(),
-        DistanceFog {
-            color: Color::srgb(0.62, 0.67, 0.74),
-            falloff: FogFalloff::Linear { start: 60.0, end: 400.0 },
-            ..default()
-        },
+        atmosphere::camera_bundle(),
+        bevy::audio::SpatialListener::new(0.3),
     ));
-    // Overcast Siberian daylight. The 2004 game had baked lighting only, and real-time
-    // shadows from its giant fog cards and glacier walls darken everything, so they're opt-in.
-    commands.spawn((
-        DirectionalLight { illuminance: 6000.0, shadow_maps_enabled: std::env::var_os("HITMAN_SHADOWS").is_some(), ..default() },
-        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.6, -0.9, 0.0)),
-    ));
+    atmosphere::spawn(&level, &bounds, &collision, &mut commands);
+    ambience::spawn(&level, &bounds.entity_world, &mut commands);
     commands.insert_resource(bounds);
     commands.insert_resource(view::EntityNames(level.entities.iter().map(|e| e.name.clone()).collect()));
     commands.insert_resource(game::Text(std::mem::take(&mut level.strings)));
@@ -144,32 +142,43 @@ fn build_wardrobe(level: &glacier::level::Level) -> game::Wardrobe {
     game::Wardrobe(out)
 }
 
+/// Engine class of trigger boxes (`…_triggerbox`, `Box_0N`, `RadiationWarning`).
+const TRIGGER_CLASS: u32 = 0x2000e1;
+
 /// Mission locations, from GMS entity names.
 fn find_anchors(level: &glacier::level::Level) -> game::Anchors {
     let at = |name: &str| level.entities.iter().find(|e| e.name == name && e.position != [0.0; 3]).map(|e| view::glacier_to_bevy(e.position));
     let tnt = level.entities.iter().filter(|e| e.name.starts_with("TNT_") && e.position != [0.0; 3]).map(|e| (view::glacier_to_bevy(e.position), false)).collect();
-    let bomb_site = at("Bomb_places").unwrap_or(Vec3::splat(f32::MAX));
-    let mut bomb_sites: Vec<(Vec3, bool)> = level
+    // The map shows three bomb icons over the submarine; the plantable spots are the
+    // `Box_0N` trigger boxes on the deck beneath them.
+    let boxes: Vec<Vec3> = level
+        .entities
+        .iter()
+        .filter(|e| e.name.starts_with("Box_0") && e.type_id == TRIGGER_CLASS && e.position != [0.0; 3])
+        .map(|e| view::glacier_to_bevy(e.position))
+        .collect();
+    let bomb_sites: Vec<(Vec3, bool)> = level
         .entities
         .iter()
         .filter(|e| e.name.starts_with("bombicon_") && e.position != [0.0; 3])
-        .map(|e| (view::glacier_to_bevy(e.position), false))
+        .map(|e| {
+            let icon = view::glacier_to_bevy(e.position);
+            let spot = boxes.iter().copied().filter(|b| b.xz().distance(icon.xz()) < 6.0).min_by(|a, b| a.xz().distance(icon.xz()).total_cmp(&b.xz().distance(icon.xz())));
+            (spot.unwrap_or_else(|| { warn!("no deck trigger under {}", e.name); icon }), false)
+        })
         .collect();
-    if bomb_sites.is_empty() {
-        bomb_sites.push((bomb_site, false));
-    }
-    let soup_pot = at("SoupCookLoc")
-        .or_else(|| at("Poison_actionbox"))
-        .unwrap_or(Vec3::new(4.49, 1.01, -41.10));
-    let radiation_suit = at("cb_BombWorker_01")
-        .unwrap_or(Vec3::new(-323.89, 0.01, -36.86));
-    let bjarkhov_office = at("CommanderBjarkhov_01")
-        .or_else(|| at("BjarkhovOffice"))
-        .unwrap_or(Vec3::new(-153.27, 7.57, 87.93));
-    let bjarkhov_desk = at("GreetFuchsLoc")
-        .unwrap_or(Vec3::new(-153.30, 7.56, 89.91));
-    let ship_gangway = at("FuchsComing_triggerbox")
-        .unwrap_or(Vec3::new(-138.85, 1.07, 78.83));
+    // Every anchor comes from a named level entity; a missing one is reported, not guessed.
+    let require = |names: &[&str]| -> Vec3 {
+        names.iter().find_map(|n| at(n)).unwrap_or_else(|| {
+            warn!("mission anchor {names:?} not found in level data; that interaction is disabled");
+            Vec3::splat(f32::MAX)
+        })
+    };
+    let soup_pot = require(&["SoupCookLoc", "Poison_actionbox"]);
+    let radiation_suit = require(&["cb_BombWorker_01"]);
+    let bjarkhov_office = require(&["BjarkhovOffice", "CommanderBjarkhov_01"]);
+    let bjarkhov_desk = require(&["GreetFuchsLoc"]);
+    let ship_gangway = require(&["FuchsComing_triggerbox"]);
     game::Anchors {
         tnt,
         bomb_sites,
@@ -177,7 +186,12 @@ fn find_anchors(level: &glacier::level::Level) -> game::Anchors {
         radiation_suit,
         exit: at("Exitbox").or_else(|| at("PlaneLoc")).unwrap_or(Vec3::splat(f32::MAX)),
         // The irradiated sub interior: around the bomb site, bounded by the radiation warning.
-        sub: (bomb_site, at("RadiationWarning").map_or(14.0, |r| r.distance(bomb_site).max(8.0))),
+        // The irradiated hull: centred on the `SubRadiactionBox` trigger (sic), reaching out to the
+        // radiation warning at the gangway.
+        sub: {
+            let core = require(&["SubRadiactionBox"]);
+            (core, at("RadiationWarning").map_or(14.0, |r| r.xz().distance(core.xz()).max(8.0)))
+        },
         bjarkhov_office,
         bjarkhov_desk,
         ship_gangway,
@@ -188,38 +202,15 @@ fn find_anchors(level: &glacier::level::Level) -> game::Anchors {
 /// actor entity is followed by a `Ground` child whose primitive is its skinned model;
 /// `_HMas` (47's disguise outfits) and `_NUDE` variants are templates, not people.
 /// Returns each actor's model by name, for the wardrobe.
-fn extract_waypoints(level: &glacier::level::Level, start_idx: usize) -> Vec<Vec3> {
-    let mut waypoints = Vec::new();
-    let count = level.entities.len();
-    if start_idx >= count {
-        return waypoints;
-    }
-    let mut curr = start_idx;
-    if level.entities[curr].position == [0.0; 3] && curr + 1 < count {
-        curr += 1;
-    }
-    while curr < count && waypoints.len() < 32 {
-        let e = &level.entities[curr];
-        let name_lower = e.name.to_ascii_lowercase();
-        if e.position == [0.0; 3] && (name_lower.contains("patrol") || name_lower.contains("guard")) {
-            break;
-        }
-        if e.position != [0.0; 3]
-            && (name_lower.contains("arrow")
-                || name_lower.contains("walk")
-                || name_lower.contains("wait")
-                || name_lower.contains("loc")
-                || name_lower.contains("point"))
-        {
-            waypoints.push(view::glacier_to_bevy(e.position));
-            curr += 1;
-        } else if !waypoints.is_empty() && (e.position == [0.0; 3] || name_lower.contains("patrol")) {
-            break;
-        } else {
-            curr += 1;
-        }
-    }
-    waypoints
+/// An actor's patrol route from its `WayPoints` path: node positions plus a pause at nodes the
+/// level designers named `…Wait…`.
+fn patrol_route(level: &glacier::level::Level, actor: &glacier::gms::Entity) -> Vec<(Vec3, f32)> {
+    let Some(path) = actor.props.as_ref().and_then(|p| p.waypoints).and_then(|i| level.entities.get(i)) else { return Vec::new() };
+    path.path
+        .iter()
+        .filter_map(|&n| level.entities.get(n))
+        .map(|n| (view::glacier_to_bevy(n.position), if n.name.contains("Wait") { 4.0 } else { 0.0 }))
+        .collect()
 }
 
 fn spawn_actors(
@@ -244,20 +235,9 @@ fn spawn_actors(
         by_actor.insert(actor.name.clone(), model.clone());
         let root = commands.spawn((view::instance_transform(actor.rotation, actor.position), Visibility::default(), Name::new(actor.name.clone()))).id();
         character::attach(commands, root, model, cast);
-        let mut waypoints = actor
-            .props
-            .as_ref()
-            .and_then(|p| if p.waypoints > 0 { Some(extract_waypoints(level, p.waypoints as usize)) } else { None })
-            .unwrap_or_default();
-        if waypoints.is_empty() {
-            let patrol_name = format!("{}_patrol", actor.name);
-            let guard_name = format!("{}_GuardPoint", actor.name);
-            if let Some(pos_idx) = level.entities.iter().position(|e| e.name == patrol_name || e.name == guard_name) {
-                waypoints = extract_waypoints(level, pos_idx);
-            }
-        }
-        if !waypoints.is_empty() {
-            info!("{} patrolling {} waypoints", actor.name, waypoints.len());
+        let route = patrol_route(level, actor);
+        if !route.is_empty() {
+            info!("{} patrols {} nodes", actor.name, route.len());
         }
 
         if let Some((set, clip)) = idle_for(lib, &actor.name) {
@@ -270,15 +250,17 @@ fn spawn_actors(
         // Stand upright, facing where the level placed them (P-space forward is −X).
         let t = view::instance_transform(actor.rotation, actor.position);
         let fwd = (t.rotation * Vec3::NEG_X).with_y(0.0).normalize_or(Vec3::NEG_Z);
+        // `WarpToPathPoint=1` (the default) starts a patroller on its route.
+        let warp = actor.props.as_ref().is_none_or(|p| p.int_props.get("WarpToPathPoint").copied().unwrap_or(1) != 0);
+        let start = match route.first() {
+            Some((p, _)) if warp => *p,
+            _ => t.translation,
+        };
         commands.entity(root).insert((
-            Transform { rotation: game::facing(fwd), ..t },
+            Transform { rotation: game::facing(fwd), translation: start, ..t },
             game::Actor::new(&actor.name),
-            game::Patrol {
-                waypoints,
-                current: 0,
-                wait_timer: 0.0,
-                forward: true,
-            },
+            game::Patrol::new(route),
+            game::Steering::default(),
         ));
         spawned += 1;
     }

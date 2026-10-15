@@ -46,7 +46,10 @@ pub struct LevelBounds {
     pub max: Vec3,
     /// Per-axis median of instance positions; robust against far-off prop libraries.
     pub median: Vec3,
+    /// World position (m) of every GMS entity, composed through the scene tree.
+    pub entity_world: Vec<Vec3>,
 }
+
 
 pub fn glacier_to_bevy(p: [f32; 3]) -> Vec3 {
     Vec3::from(p) * MIRROR * CM_TO_M
@@ -67,7 +70,8 @@ pub fn spawn_level(
     images: &mut Assets<Image>,
     collision: &mut WorldCollision,
 ) -> LevelBounds {
-    let mut model_cache: HashMap<u32, CachedModel> = HashMap::new();
+    // Keyed by model and by the per-entity flags that change what counts as solid.
+    let mut model_cache: HashMap<(u32, bool, bool), CachedModel> = HashMap::new();
     let mut material_cache: HashMap<MaterialKey, Handle<StandardMaterial>> = HashMap::new();
     let mut positions = Vec::new();
     // Debug: `HITMAN_HIDE=Shadow,Fog` skips entities whose names contain any of the substrings.
@@ -83,6 +87,7 @@ pub fn spawn_level(
 
     let mut stack: Vec<Frame> = Vec::new();
     let mut world_positions = Vec::with_capacity(level.entities.len());
+    let mut world_rotations: Vec<[[f32; 3]; 3]> = Vec::with_capacity(level.entities.len());
     let mut parent_indices: Vec<Option<usize>> = Vec::with_capacity(level.entities.len());
 
     for (index, e) in level.entities.iter().enumerate() {
@@ -120,21 +125,32 @@ pub fn spawn_level(
             || e.position[1].abs() > 1.0
             || e.position[2].abs() > 1.0;
 
+        // Rotations compose like positions: for row vectors, world = local · parent.
+        let world_rot = match stack.last() {
+            Some(p) if is_child_of_physical => mat3_mul(e.rotation, p.rot),
+            _ => e.rotation,
+        };
         if (e.tree_bits & 1) != 0 {
             stack.push(Frame {
                 world_pos,
-                rot: e.rotation,
+                rot: world_rot,
                 is_physical,
                 entity_idx: index,
             });
         }
         world_positions.push(world_pos);
+        world_rotations.push(world_rot);
     }
 
+    let lifts = layer_flats(level, &world_positions, &world_rotations);
     let mut ddoor_leaves: HashMap<usize, Vec<(bevy::prelude::Entity, u32)>> = HashMap::new();
 
     for (index, e) in level.entities.iter().enumerate() {
         if e.primitive == 0 || !level.prm.is_record(e.primitive) {
+            continue;
+        }
+        // `MAP_*` geometry is the in-game map screen's floor plan, placed over the real floors.
+        if e.name.starts_with("MAP_") {
             continue;
         }
         if HELPER_TYPES.contains(&e.type_id) || e.flags & FLAG_FX_TEMPLATE != 0 {
@@ -153,7 +169,7 @@ pub fn spawn_level(
             || e.name.contains("Shadow")
             || e.name.contains("Glow")
             || e.name.contains("Corona");
-        let cached = model_cache.entry(e.primitive).or_insert_with(|| match level.prm.model(e.primitive) {
+        let cached = model_cache.entry((e.primitive, is_coli_hull, is_non_solid)).or_insert_with(|| match level.prm.model(e.primitive) {
             // Untextured models are collision hulls, position boxes and emitters; only the
             // hulls matter, and only for collision.
             Ok(model) if model.submeshes.iter().all(|sm| sm.texture == 0) => CachedModel {
@@ -190,7 +206,8 @@ pub fn spawn_level(
             }
         });
 
-        let transform = instance_transform(e.rotation, world_positions[index]);
+        let mut transform = instance_transform(world_rotations[index], world_positions[index]);
+        transform.translation.y += lifts.get(&index).copied().unwrap_or(0.0);
         let world = transform.to_matrix();
         for t in cached.solid.iter().filter(|_| e.type_id == STATIC_GEOM_TYPE) {
             collision.add_triangle(t.map(|v| world.transform_point3(v)), index as u32);
@@ -200,6 +217,42 @@ pub fn spawn_level(
         }
 
         positions.push(transform.translation);
+        if let Some(props) = &e.cloth {
+            // Cloth: a private world-space copy of the mesh, held by the anchor boxes.
+            let anchors: Vec<(Vec3, Vec3)> = props
+                .anchors
+                .iter()
+                .filter_map(|&a| {
+                    let ae = level.entities.get(a)?;
+                    let model = level.prm.model(ae.primitive).ok()?;
+                    let to_world = instance_transform(world_rotations[a], world_positions[a]).to_matrix();
+                    model
+                        .submeshes
+                        .iter()
+                        .flat_map(|sm| sm.vertices.iter().map(|v| to_world.transform_point3(Vec3::from(swap_xz(v.pos)))))
+                        .fold(None, |acc: Option<(Vec3, Vec3)>, p| Some(acc.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p)))))
+                })
+                .collect();
+            let wind = Vec3::from(props.wind).length();
+            for (k, (mesh, key)) in cached.parts.iter().enumerate() {
+                let Some((dynamic, world, indices)) = meshes.get(mesh).and_then(|m| crate::cloth::dynamic_mesh(m, &GlobalTransform::from(transform)))
+                else {
+                    continue;
+                };
+                let handle = meshes.add(dynamic);
+                let material = material_cache.entry(*key).or_insert_with(|| materials.add(build_material(&level.tex, *key, images))).clone();
+                commands.spawn((
+                    Mesh3d(handle.clone()),
+                    MeshMaterial3d(material),
+                    crate::cloth::Cloth::new(handle, &world, &indices, &anchors, wind, index as f32 + k as f32),
+                    bevy::camera::visibility::NoFrustumCulling,
+                    LevelGeom,
+                    Name::new(e.name.clone()),
+                ));
+            }
+            info!("cloth {}: {} anchors, wind {:.2}", e.name, anchors.len(), wind);
+            continue;
+        }
         let bevy_entity = commands
             .spawn((transform, Visibility::default(), LevelGeom, Name::new(e.name.clone())))
             .with_children(|c| {
@@ -293,10 +346,21 @@ pub fn spawn_level(
         positions.get(positions.len() / 2).map_or(0.0, |p| p[k])
     };
     let median = Vec3::new(axis(0), axis(1), axis(2));
-    LevelBounds { min, max, median }
+    let entity_world: Vec<Vec3> = world_positions.iter().map(|p| glacier_to_bevy(*p)).collect();
+    LevelBounds { min, max, median, entity_world }
 }
 
 /// Applies `P` (see module docs): PRM vertex space → entity-matrix space.
+fn mat3_mul(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0; 3]; 3];
+    for (r, row) in out.iter_mut().enumerate() {
+        for (c, v) in row.iter_mut().enumerate() {
+            *v = (0..3).map(|k| a[r][k] * b[k][c]).sum();
+        }
+    }
+    out
+}
+
 pub(crate) fn swap_xz([x, y, z]: [f32; 3]) -> [f32; 3] {
     [z, y, x]
 }
@@ -313,8 +377,78 @@ pub(crate) fn instance_transform(r: [[f32; 3]; 3], p: [f32; 3]) -> Transform {
     Transform::from_matrix(Mat4::from_mat3_translation(linear, glacier_to_bevy(p)))
 }
 
+/// Vertical step (m) between stacked coplanar layers, and the extra lift for blended decals.
+const LAYER_STEP: f32 = 0.003;
+const DECAL_LIFT: f32 = 0.008;
+
+/// The level stacks many flat pieces on exactly the same plane: snow sheets over ground tiles,
+/// puddles on floors. The original engine resolved them by draw order; with a depth buffer
+/// alone they fight and the floor flickers as the camera moves. This recreates the order: among
+/// flat models overlapping at the same height, later entities sit higher, and blended decals sit
+/// above opaque floors. Returns a lift (m) per entity index.
+fn layer_flats(level: &Level, positions: &[[f32; 3]], rotations: &[[[f32; 3]; 3]]) -> HashMap<usize, f32> {
+    struct Flat {
+        index: usize,
+        height: i32,
+        min: Vec2,
+        max: Vec2,
+        decal: bool,
+    }
+    let mut flats = Vec::new();
+    for (index, e) in level.entities.iter().enumerate() {
+        if e.type_id != STATIC_GEOM_TYPE || !level.prm.is_record(e.primitive) || e.name.starts_with("MAP_") {
+            continue;
+        }
+        let Ok(model) = level.prm.model(e.primitive) else { continue };
+        let parts: Vec<_> = model.submeshes.iter().filter(|s| s.in_lod0() && s.texture != 0).collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let world = instance_transform(rotations[index], positions[index]).to_matrix();
+        let (mut lo, mut hi) = (Vec3::MAX, Vec3::MIN);
+        for v in parts.iter().flat_map(|s| s.vertices.iter()) {
+            let w = world.transform_point3(Vec3::from(swap_xz(v.pos)));
+            lo = lo.min(w);
+            hi = hi.max(w);
+        }
+        if hi.y - lo.y > 0.015 {
+            continue; // not a flat piece
+        }
+        flats.push(Flat { index, height: (hi.y * 500.0).round() as i32, min: lo.xz(), max: hi.xz(), decal: parts.iter().all(|s| s.blended) });
+    }
+    let mut lifts = HashMap::new();
+    for (k, f) in flats.iter().enumerate() {
+        let below = flats[..k]
+            .iter()
+            .filter(|g| (g.height - f.height).abs() <= 2 && g.decal == f.decal && g.min.cmplt(f.max).all() && f.min.cmplt(g.max).all())
+            .count()
+            .min(4);
+        let lift = below as f32 * LAYER_STEP + if f.decal { DECAL_LIFT } else { 0.0 };
+        if lift > 0.0 {
+            lifts.insert(f.index, lift);
+        }
+    }
+    lifts
+}
+
+/// How far (cm) underlay quads are sunk below the layers drawn over them.
+const UNDERLAY_SINK: f32 = 4.0;
+
+/// A single large flat quad, such as the dirt under each `Ground_20x14` tile. The snow patches
+/// laid over it sit at exactly the same height; the original resolved that by draw order, so
+/// we sink the underlay instead, or the two fight and the ground flickers as the camera moves.
+fn is_underlay(sm: &prm::SubMesh) -> bool {
+    if sm.blended || sm.vertices.len() != 4 {
+        return false;
+    }
+    let (lo, hi) = sm.vertices.iter().fold((Vec3::MAX, Vec3::MIN), |(a, b), v| (a.min(Vec3::from(v.pos)), b.max(Vec3::from(v.pos))));
+    let size = hi - lo;
+    size.y < 1.0 && size.x * size.z > 20.0 * 100.0 * 100.0
+}
+
 fn build_mesh(sm: &prm::SubMesh) -> Mesh {
-    let pos: Vec<[f32; 3]> = sm.vertices.iter().map(|v| swap_xz(v.pos)).collect();
+    let sink = if is_underlay(sm) { UNDERLAY_SINK } else { 0.0 };
+    let pos: Vec<[f32; 3]> = sm.vertices.iter().map(|v| swap_xz([v.pos[0], v.pos[1] - sink, v.pos[2]])).collect();
     let nrm: Vec<[f32; 3]> = sm.vertices.iter().map(|v| swap_xz(v.normal)).collect();
     let uv: Vec<[f32; 2]> = sm.vertices.iter().map(|v| v.uv).collect();
     let col: Vec<[f32; 4]> = sm.vertices.iter().map(|v| v.color.map(|c| c as f32 / 255.0)).collect();

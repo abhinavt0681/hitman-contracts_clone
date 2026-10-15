@@ -16,6 +16,11 @@
 //!   (0 or a non-record offset for non-mesh entities)
 //! - `+0x10 u32 type_id` — engine class id (e.g. 0x200002 static geometry)
 //! - `+0x18 u32 flags`
+//! - after `+0x20`, actors carry a property blob (see `parse_script_props`); path groups
+//!   (class `0x080000C8`) point at their node list from `+0x20` (see `parse_path`)
+//!
+//! Entity references (`ZGEOMREF` values, path nodes) are `0x80000000 | (index + 1)`: 1-based
+//! entity-table indices with a flag bit; 0 means "none".
 
 use super::ReadLe;
 use anyhow::{Context, Result, bail};
@@ -28,9 +33,9 @@ pub struct ScriptProps {
     pub script: String,
     pub hitpoints: i32,
     pub character_type: i32,
-    pub waypoints: u32,
-    pub weapon_template: u32,
-    pub guard_point: u32,
+    pub waypoints: Option<usize>,
+    pub weapon_template: Option<usize>,
+    pub guard_point: Option<usize>,
     pub is_sentry: i32,
     pub sentry_radius: f32,
     pub relaxed_vis_range: f32,
@@ -38,7 +43,7 @@ pub struct ScriptProps {
     pub wait_time: f32,
     pub int_props: HashMap<String, i32>,
     pub float_props: HashMap<String, f32>,
-    pub ref_props: HashMap<String, u32>,
+    pub ref_props: HashMap<String, usize>,
     pub str_props: HashMap<String, String>,
 }
 
@@ -51,6 +56,69 @@ pub struct Entity {
     pub position: [f32; 3],
     pub tree_bits: u8,
     pub props: Option<ScriptProps>,
+    /// For path groups (class `PATH_CLASS`): node entity indices in walking order.
+    pub path: Vec<usize>,
+    /// For cloth (class `CLOTH_CLASS`): its simulation settings.
+    pub cloth: Option<ClothProps>,
+    /// For sound emitters (class `SOUND_CLASS`): the sound, as an offset into the level's
+    /// `.SND` table (see `Level::sound_name`).
+    pub sound: Option<u32>,
+}
+
+/// Engine class of placed sound emitters (`enum Type={3D,…}; SndRef Sound; float
+/// InnerConeAngle; float OuterConeAngle; float OuterConeVolume; float LPCutOffFreq; bool
+/// AutoAttach; BOOL Loop; float Volume; float mindist; …`): tag `0x8b` + u32 at +9 of the
+/// property block is `Sound`.
+pub const SOUND_CLASS: u32 = 0x0020_0012;
+
+/// Engine class `ZCloth`: a mesh simulated as cloth, pinned at its anchor boxes.
+pub const CLOTH_CLASS: u32 = 0x0020_00f6;
+
+/// The parts of `ZCloth`'s properties (`int MaxNumberVisible; int Iterations; enum UseWind;
+/// double WindSpeed[3]; …; ZGEOMREFTAB AnchorBoxes; …; float Gravity=1500`) we use.
+#[derive(Clone, Debug)]
+pub struct ClothProps {
+    /// Entities whose boxes hold the cloth in place.
+    pub anchors: Vec<usize>,
+    /// Wind the cloth feels, in the cloth's own units (relative strength).
+    pub wind: [f32; 3],
+}
+
+/// Cloth property block (pointed to by the entity record at +0x20): tagged values, where
+/// `0x89, u32 size, refs…` is the anchor table and `0x81 f64, 0x41 f64, 0x41 f64` the first
+/// three-double array, `WindSpeed`.
+fn parse_cloth(body: &[u8], at: usize) -> Option<ClothProps> {
+    let block = body.get(at..(at + 512).min(body.len()))?;
+    let table = block.iter().position(|&b| b == 0x89)?;
+    let size = u32::from_le_bytes(block.get(table + 1..table + 5)?.try_into().ok()?) as usize;
+    let anchors = (0..size.saturating_sub(4) / 4)
+        .filter_map(|k| {
+            let at = table + 5 + k * 4;
+            entity_ref(u32::from_le_bytes(block.get(at..at + 4)?.try_into().ok()?))
+        })
+        .collect();
+    let double = |at: usize| block.get(at..at + 8).map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32);
+    let wind = (0..table)
+        .find(|&i| block[i] == 0x81 && block.get(i + 9) == Some(&0x41) && block.get(i + 18) == Some(&0x41))
+        .and_then(|i| Some([double(i + 1)?, double(i + 10)?, double(i + 19)?]))
+        .unwrap_or([0.0; 3]);
+    Some(ClothProps { anchors, wind })
+}
+
+/// Engine class of patrol paths: a group whose node list references waypoint entities.
+pub const PATH_CLASS: u32 = 0x0800_00c8;
+
+/// Decodes an entity reference: `0x80000000 | (index + 1)`, 0 = none.
+pub fn entity_ref(raw: u32) -> Option<usize> {
+    (raw & 0x00ff_ffff).checked_sub(1).map(|i| i as usize)
+}
+
+/// Path node list: `u32 size, u32 header, u8 0`, then `(size - 22) / 4` references, then a
+/// 13-byte trailer.
+fn parse_path(body: &[u8], at: usize) -> Vec<usize> {
+    let Ok(size) = body.u32_at(at) else { return Vec::new() };
+    let count = (size as usize).saturating_sub(22) / 4;
+    (0..count.min(256)).filter_map(|k| body.u32_at(at + 9 + k * 4).ok()).take_while(|r| r >> 31 == 1).filter_map(entity_ref).collect()
 }
 
 pub fn inflate(raw: &[u8]) -> Result<Vec<u8>> {
@@ -148,12 +216,12 @@ fn parse_script_props(chunk: &[u8]) -> Option<ScriptProps> {
                     break;
                 }
                 let ref_val = u32::from_le_bytes([chunk[p], chunk[p + 1], chunk[p + 2], chunk[p + 3]]);
-                let entity_idx = ref_val & 0x00ff_ffff;
                 p += 4;
+                let Some(entity_idx) = entity_ref(ref_val) else { continue };
                 match fname.as_str() {
-                    "WayPoints" => props.waypoints = entity_idx,
-                    "WeaponTemplate" => props.weapon_template = entity_idx,
-                    "GuardPoint" => props.guard_point = entity_idx,
+                    "WayPoints" => props.waypoints = Some(entity_idx),
+                    "WeaponTemplate" => props.weapon_template = Some(entity_idx),
+                    "GuardPoint" => props.guard_point = Some(entity_idx),
                     _ => {}
                 }
                 props.ref_props.insert(fname, entity_idx);
@@ -194,16 +262,27 @@ pub fn parse_entities(body: &[u8], buf: &[u8]) -> Result<Vec<Entity>> {
                 *v = body.f32_at(rot_at + (r * 3 + c) * 4)?;
             }
         }
-        let next_e = sorted_offsets.iter().copied().find(|&off| off > e).unwrap_or(body.len());
+        let next_e = sorted_offsets.get(sorted_offsets.partition_point(|&off| off <= e)).copied().unwrap_or(body.len());
         let props = if next_e > e + 0x20 {
             parse_script_props(&body[e + 0x20..next_e])
         } else {
             None
         };
 
+        let type_id = body.u32_at(e + 0x10)?;
+        let cloth = if type_id == CLOTH_CLASS { body.u32_at(e + 0x20).ok().and_then(|at| parse_cloth(body, at as usize)) } else { None };
+        let sound = if type_id == SOUND_CLASS {
+            body.u32_at(e + 0x20).ok().and_then(|at| (body.get(at as usize + 9) == Some(&0x8b)).then(|| body.u32_at(at as usize + 10).ok()).flatten())
+        } else {
+            None
+        };
+        let path = if type_id == PATH_CLASS { body.u32_at(e + 0x20).map(|at| parse_path(body, at as usize)).unwrap_or_default() } else { Vec::new() };
         out.push(Entity {
             name: buf.cstr_at(body.u32_at(e)? as usize).unwrap_or("<bad name>").to_owned(),
-            type_id: body.u32_at(e + 0x10)?,
+            type_id,
+            path,
+            cloth,
+            sound,
             flags: body.u32_at(e + 0x18)?,
             primitive: body.u32_at(e + 0x0c)?,
             rotation,

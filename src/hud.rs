@@ -60,7 +60,8 @@ fn spawn_hud(mut commands: Commands) {
     commands.spawn((
         Text::new("WASD: Move | Shift: Run | Ctrl / C: Sneak | 1-5 / Scroll: Item | E: Action | G: Drag/Drop Body | Click: Shoot"),
         text(13.0, Color::srgba(0.85, 0.85, 0.82, 0.60)),
-        Node { position_type: PositionType::Absolute, bottom: px(14.0), right: px(16.0), ..default() },
+        // Top right, clear of the status lines at the bottom.
+        Node { position_type: PositionType::Absolute, top: px(14.0), right: px(16.0), max_width: percent(45.0), ..default() },
         HudText::Controls,
     ));
 }
@@ -74,9 +75,11 @@ fn update_hud(
     mission: Res<Mission>,
     actors: Query<&Actor>,
     player: Query<&crate::player::Player>,
+    exposure: Res<crate::atmosphere::Exposure>,
     mut q: Query<(&HudText, &mut Text)>,
 ) {
     let suspicion = actors.iter().filter(|a| a.alive).map(|a| if a.alerted { 1.0 } else { a.suspicion }).fold(0.0, f32::max);
+    let hunted = actors.iter().any(|a| a.alive && a.alerted);
     let crouching = player.single().is_ok_and(|p| p.crouching);
     let dragging = mission.dragging_body.is_some();
     let posture = if dragging {
@@ -96,11 +99,17 @@ fn update_hud(
                 .collect::<Vec<_>>()
                 .join("\n"),
             HudText::Status => format!(
-                "Health {}   Suspicion {}{}{}\nOutfit: {}\nItem: [{}] {}{}{}",
+                "Health {}   Suspicion {}{}{}\nLight {}{}\nOutfit: {}\nItem: [{}] {}{}{}",
                 bar(mission.health / 100.0),
                 bar(suspicion),
-                if mission.alarm { "   ALARM" } else { "" },
+                match (hunted, mission.alarm) {
+                    (true, _) => "   HUNTED",
+                    (false, true) => "   ALERT",
+                    _ => "",
+                },
                 posture,
+                bar(exposure.light),
+                if exposure.gust > 0.5 { "   [SQUALL]" } else { "" },
                 crate::game::outfit_label(mission.outfit),
                 match mission.active_item {
                     crate::game::Item::Holstered => "1",

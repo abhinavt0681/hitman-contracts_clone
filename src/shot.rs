@@ -5,7 +5,8 @@
 //! and turns off fog.
 //! `HITMAN_START="x,y,z"` / `HITMAN_YAW=radians` override 47's spawn and facing.
 //! `HITMAN_SHOT_FRAME=n` captures at frame n instead of the default.
-//! `HITMAN_AUTOWALK=secs` holds W (plus Shift if `HITMAN_AUTORUN` is set) for that long,
+//! `HITMAN_AUTOWALK=secs[@start]` holds W (plus Shift if `HITMAN_AUTORUN` is set) for that long,
+//! from `start` seconds in (default 0),
 //! to exercise 47's movement and collision. `HITMAN_AUTOKEY=D` presses D instead, which
 //! strafes him across the camera's view (handy for checking the gait side-on).
 //! `HITMAN_KEYS="E@0.2,E@2.6"` taps keys at given times (seconds after startup).
@@ -25,8 +26,11 @@ impl Plugin for ShotPlugin {
         if std::env::var_os("HITMAN_CAM").is_some() {
             app.add_systems(PostStartup, place_camera);
         }
-        if let Some(secs) = std::env::var("HITMAN_AUTOWALK").ok().and_then(|s| s.parse::<f32>().ok()) {
-            app.insert_resource(AutoWalk(secs)).add_systems(PreUpdate, auto_walk.after(bevy::input::InputSystems));
+        if let Some((secs, start)) = std::env::var("HITMAN_AUTOWALK").ok().and_then(|s| {
+            let (secs, start) = s.split_once('@').unwrap_or((&s, "0"));
+            Some((secs.parse::<f32>().ok()?, start.parse::<f32>().ok()?))
+        }) {
+            app.insert_resource(AutoWalk(secs, start)).add_systems(PreUpdate, auto_walk.after(bevy::input::InputSystems));
         }
         if let Ok(spec) = std::env::var("HITMAN_KEYS") {
             let taps = spec
@@ -80,7 +84,7 @@ fn place_camera(mut commands: Commands, mut cam: Query<(Entity, &mut Transform),
 }
 
 #[derive(Resource)]
-struct AutoWalk(f32);
+struct AutoWalk(f32, f32);
 
 #[derive(Resource)]
 struct KeyTaps(Vec<(KeyCode, f32)>);
@@ -98,6 +102,10 @@ fn tap_keys(time: Res<Time>, mut taps: ResMut<KeyTaps>, mut keys: ResMut<ButtonI
 }
 
 fn auto_walk(time: Res<Time>, mut walk: ResMut<AutoWalk>, mut keys: ResMut<ButtonInput<KeyCode>>) {
+    if walk.1 > 0.0 {
+        walk.1 -= time.delta_secs();
+        return;
+    }
     walk.0 -= time.delta_secs();
     let key = match std::env::var("HITMAN_AUTOKEY").as_deref() {
         Ok("D") => KeyCode::KeyD,
