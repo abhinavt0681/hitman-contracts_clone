@@ -1,3 +1,5 @@
 /target
 /data
 /Hitman Contracts
+__pycache__/
+*.pyc

@@ -235,7 +235,8 @@ struct Selected(usize);
 const ITEMS: [(MenuItem, &str); 4] = [(MenuItem::Resume, "Resume"), (MenuItem::Briefing, "Briefing"), (MenuItem::Restart, "Restart mission"), (MenuItem::Quit, "Quit")];
 
 const CONTROLS: &str = "WASD move   Shift run   Ctrl / C sneak   Mouse look\n\
-E action   G drag / drop body   1-5 or wheel: item   Left click: use item\n\
+E action   F take a rifle   G drag / drop body   1-6 or wheel: item\n\
+Left click: use item / fire   Right mouse: aim   R reload\n\
 M / Tab map   Esc menu   F1 free camera";
 
 fn open_pause_menu(mut commands: Commands, mission: Option<Res<Mission>>) {
