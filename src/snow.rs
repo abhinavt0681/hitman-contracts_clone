@@ -215,7 +215,7 @@ fn drive_snow(
     exposure: Res<Exposure>,
     lamps: Option<Res<Lamps>>,
     mut travel: ResMut<WindTravel>,
-    camera: Query<&GlobalTransform, With<Camera3d>>,
+    camera: Query<&GlobalTransform, With<crate::player::OrbitCamera>>,
     mut streak_q: Query<(&Streaks, &mut Visibility), Without<Veils>>,
     mut veil_q: Query<(&Veils, &mut Visibility), Without<Streaks>>,
     mut streak_materials: ResMut<Assets<StreakMaterial>>,

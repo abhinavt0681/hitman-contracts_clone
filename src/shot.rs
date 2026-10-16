@@ -9,7 +9,8 @@
 //! from `start` seconds in (default 0),
 //! to exercise 47's movement and collision. `HITMAN_AUTOKEY=D` presses D instead, which
 //! strafes him across the camera's view (handy for checking the gait side-on).
-//! `HITMAN_KEYS="E@0.2,E@2.6"` taps keys at given times (seconds after startup).
+//! `HITMAN_KEYS="E@0.2,E@2.6,RMB@3-5,LMB@4"` taps keys or mouse buttons at given times
+//! (seconds after startup), or holds them over a range.
 
 use bevy::{
     prelude::*,
@@ -37,22 +38,32 @@ impl Plugin for ShotPlugin {
                 .split(',')
                 .filter_map(|t| {
                     let (k, at) = t.split_once('@')?;
-                    let key = match k {
-                        "E" => KeyCode::KeyE,
-                        "W" => KeyCode::KeyW,
-                        "G" => KeyCode::KeyG,
-                        "C" => KeyCode::KeyC,
-                        "Ctrl" => KeyCode::ControlLeft,
-                        "Alt" => KeyCode::AltLeft,
-                        "Enter" => KeyCode::Enter,
-                        "1" => KeyCode::Digit1,
-                        "2" => KeyCode::Digit2,
-                        "3" => KeyCode::Digit3,
-                        "4" => KeyCode::Digit4,
-                        "5" => KeyCode::Digit5,
+                    let press = match k {
+                        "E" => Press::Key(KeyCode::KeyE),
+                        "W" => Press::Key(KeyCode::KeyW),
+                        "G" => Press::Key(KeyCode::KeyG),
+                        "C" => Press::Key(KeyCode::KeyC),
+                        "F" => Press::Key(KeyCode::KeyF),
+                        "R" => Press::Key(KeyCode::KeyR),
+                        "Ctrl" => Press::Key(KeyCode::ControlLeft),
+                        "Alt" => Press::Key(KeyCode::AltLeft),
+                        "Enter" => Press::Key(KeyCode::Enter),
+                        "1" => Press::Key(KeyCode::Digit1),
+                        "2" => Press::Key(KeyCode::Digit2),
+                        "3" => Press::Key(KeyCode::Digit3),
+                        "4" => Press::Key(KeyCode::Digit4),
+                        "5" => Press::Key(KeyCode::Digit5),
+                        "6" => Press::Key(KeyCode::Digit6),
+                        "LMB" => Press::Mouse(MouseButton::Left),
+                        "RMB" => Press::Mouse(MouseButton::Right),
                         _ => return None,
                     };
-                    Some((key, at.parse::<f32>().ok()?))
+                    // `K@t` taps at t; `K@a-b` holds from a to b.
+                    let (start, end) = match at.split_once('-') {
+                        Some((a, b)) => (a.parse::<f32>().ok()?, b.parse::<f32>().ok()?),
+                        None => (at.parse::<f32>().ok()?, 0.0),
+                    };
+                    Some((press, start, end))
                 })
                 .collect();
             app.insert_resource(KeyTaps(taps)).add_systems(PreUpdate, tap_keys.after(bevy::input::InputSystems));
@@ -71,11 +82,15 @@ pub fn env_vec3(var: &str) -> Option<Vec3> {
     if let [x, y, z] = v[..] { Some(Vec3::new(x, y, z)) } else { None }
 }
 
-fn place_camera(mut commands: Commands, mut cam: Query<(Entity, &mut Transform), With<Camera3d>>) {
+fn place_camera(mut commands: Commands, mut cam: Query<(Entity, &mut Transform), With<crate::player::OrbitCamera>>) {
     let v: Vec<f32> = std::env::var("HITMAN_CAM").unwrap_or_default().split(',').filter_map(|s| s.trim().parse().ok()).collect();
     let Ok((id, mut t)) = cam.single_mut() else { return };
     // Inspection shots want to see everything, not atmosphere; flying detaches from 47.
-    commands.entity(id).remove::<bevy::pbr::DistanceFog>().insert(bevy::camera_controller::free_camera::FreeCamera::default());
+    // `HITMAN_CAM_FOG=1` keeps the fog (for comparing looks from a fixed viewpoint).
+    if std::env::var_os("HITMAN_CAM_FOG").is_none() {
+        commands.entity(id).remove::<bevy::pbr::DistanceFog>();
+    }
+    commands.entity(id).insert(bevy::camera_controller::free_camera::FreeCamera::default());
     if let [x, y, z, tx, ty, tz] = v[..] {
         *t = Transform::from_xyz(x, y, z).looking_at(Vec3::new(tx, ty, tz), Vec3::Y);
     } else {
@@ -87,16 +102,30 @@ fn place_camera(mut commands: Commands, mut cam: Query<(Entity, &mut Transform),
 struct AutoWalk(f32, f32);
 
 #[derive(Resource)]
-struct KeyTaps(Vec<(KeyCode, f32)>);
+/// Scripted input: a key or mouse button, pressed at `start` and released at `end` (one
+/// frame for a tap).
+struct KeyTaps(Vec<(Press, f32, f32)>);
 
-fn tap_keys(time: Res<Time>, mut taps: ResMut<KeyTaps>, mut keys: ResMut<ButtonInput<KeyCode>>) {
+#[derive(Clone, Copy)]
+enum Press {
+    Key(KeyCode),
+    Mouse(MouseButton),
+}
+
+fn tap_keys(time: Res<Time<Real>>, mut taps: ResMut<KeyTaps>, mut keys: ResMut<ButtonInput<KeyCode>>, mut mouse: ResMut<ButtonInput<MouseButton>>) {
     let now = time.elapsed_secs();
-    for (key, at) in taps.0.iter_mut() {
-        if *at >= 0.0 && now >= *at {
-            keys.press(*key);
-            *at = -1.0;
-        } else if *at < 0.0 {
-            keys.release(*key);
+    for (press, start, end) in taps.0.iter_mut() {
+        let down = now >= *start && (now < *end || *start >= 0.0);
+        match (*press, down) {
+            (Press::Key(k), true) => keys.press(k),
+            (Press::Key(k), false) => keys.release(k),
+            (Press::Mouse(b), true) => mouse.press(b),
+            (Press::Mouse(b), false) => mouse.release(b),
+        }
+        // A tap lasts one frame.
+        if down && *end <= *start {
+            *start = -1.0;
+            *end = -1.0;
         }
     }
 }

@@ -8,7 +8,7 @@
 //! (`S = diag(1, 1, −1)`) and scale by 0.01, so the instance transform is `S·R` (a proper
 //! rotation) and `S·p`.
 
-use crate::collision::WorldCollision;
+use crate::collision::{Surface, WorldCollision};
 use crate::game::{Door, DoorLeaf};
 use hitman_clone::glacier::{level::Level, prm, tex};
 use bevy::{
@@ -60,6 +60,11 @@ pub fn glacier_to_bevy(p: [f32; 3]) -> Vec3 {
 struct CachedModel {
     parts: Vec<(Handle<Mesh>, MaterialKey)>,
     solid: Vec<[Vec3; 3]>,
+    /// Every visible triangle, blended layers included: candidates for walkable floor
+    /// (snow drifts, the submarine deck) that the collision proxies don't cover.
+    surface: Vec<([Vec3; 3], Surface)>,
+    /// What the model is mostly made of (its largest visible texture), for its proxies.
+    material: Surface,
 }
 
 pub fn spawn_level(
@@ -75,6 +80,12 @@ pub fn spawn_level(
     let mut material_cache: HashMap<MaterialKey, Handle<StandardMaterial>> = HashMap::new();
     let mut positions = Vec::new();
     // Debug: `HITMAN_HIDE=Shadow,Fog` skips entities whose names contain any of the substrings.
+    let mut map_textures: HashMap<u32, bool> = HashMap::new();
+    let mut tex_surfaces: HashMap<u32, Surface> = HashMap::new();
+    let coverage = crate::shot::env_vec3("HITMAN_COVERAGE");
+    let holes = std::env::var_os("HITMAN_HOLES").is_some();
+    let mut drawn = WorldCollision::default();
+    let hide_tex: Vec<u32> = std::env::var("HITMAN_HIDE_TEX").map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect()).unwrap_or_default();
     let hide: Vec<String> = std::env::var("HITMAN_HIDE").map(|v| v.split(',').map(str::to_owned).collect()).unwrap_or_default();
 
     // First, resolve the full scene graph hierarchy to get world positions for all entities.
@@ -149,8 +160,10 @@ pub fn spawn_level(
         if e.primitive == 0 || !level.prm.is_record(e.primitive) {
             continue;
         }
-        // `MAP_*` geometry is the in-game map screen's floor plan, placed over the real floors.
-        if e.name.starts_with("MAP_") {
+        // The in-game map screen's floor plans (`MAP_*`, `C02-1__MAP_Hangar`, …) are laid over
+        // the real floors; they're drawn with the map's colour texture.
+        if is_map_geometry(level, e, &mut map_textures) {
+            spawn_map_piece(level, e, instance_transform(world_rotations[index], world_positions[index]), commands, meshes, materials, images);
             continue;
         }
         if HELPER_TYPES.contains(&e.type_id) || e.flags & FLAG_FX_TEMPLATE != 0 {
@@ -160,7 +173,10 @@ pub fn spawn_level(
             continue;
         }
         let is_coli_hull = e.name.contains("Coli");
-        let is_non_solid = e.name.contains("Cable")
+        // Effects and sky: never something to stand on.
+        let is_effect = ["Sky", "Blowing", "Fog", "Glitter", "GlowVol", "GlowRain", "Snow_", "SnowBlowing"].iter().any(|k| e.name.contains(k));
+        let is_non_solid = is_effect
+            || e.name.contains("Cable")
             || e.name.contains("Decal")
             || e.name.contains("Light")
             || e.name.contains("Lamp")
@@ -172,15 +188,17 @@ pub fn spawn_level(
         let cached = model_cache.entry((e.primitive, is_coli_hull, is_non_solid)).or_insert_with(|| match level.prm.model(e.primitive) {
             // Untextured models are collision hulls, position boxes and emitters; only the
             // hulls matter, and only for collision.
-            Ok(model) if model.submeshes.iter().all(|sm| sm.texture == 0) => CachedModel {
+            Ok(model) if model.submeshes.iter().all(|sm| sm.is_proxy()) => CachedModel {
                 parts: Vec::new(),
                 solid: if is_coli_hull { model.submeshes.iter().flat_map(local_triangles).collect() } else { Vec::new() },
+                surface: Vec::new(),
+                material: Surface::default(),
             },
             Ok(model) => {
-                // Untextured parts (render state 0xC000 bits) are simplified collision proxies:
-                // a cylinder for a drum, boxes for doors and fences. Never drawn.
+                // Proxies (untextured, or render state bit 0x800000) are simplified collision
+                // shapes: a cylinder for a drum, boxes for doors, fences and the plane. Never drawn.
                 let lod0 = model.submeshes.iter().filter(|sm| sm.in_lod0());
-                let (proxies, visible): (Vec<_>, Vec<_>) = lod0.partition(|sm| sm.texture == 0);
+                let (proxies, visible): (Vec<_>, Vec<_>) = lod0.partition(|sm| sm.is_proxy());
                 let solid_parts = if is_non_solid {
                     Vec::new()
                 } else if !proxies.is_empty() {
@@ -195,9 +213,21 @@ pub fn spawn_level(
                         .collect(),
                     solid: solid_parts
                         .iter()
-                        .filter(|sm| sm.texture == 0 || !sm.blended)
+                        .filter(|sm| sm.is_proxy() || !sm.blended)
                         .flat_map(|sm| local_triangles(sm))
                         .collect(),
+                    surface: if is_non_solid {
+                        Vec::new()
+                    } else {
+                        visible.iter().flat_map(|sm| {
+                            let kind = surface_of(level, sm.texture, &mut tex_surfaces);
+                            local_triangles(sm).map(move |t| (t, kind))
+                        }).collect()
+                    },
+                    material: visible
+                        .iter()
+                        .max_by(|a, b| area(a).total_cmp(&area(b)))
+                        .map_or(Surface::default(), |sm| surface_of(level, sm.texture, &mut tex_surfaces)),
                 }
             }
             Err(err) => {
@@ -206,17 +236,62 @@ pub fn spawn_level(
             }
         });
 
+        let col_world = instance_transform(world_rotations[index], world_positions[index]).to_matrix();
+        for t in cached.solid.iter().filter(|_| e.type_id == STATIC_GEOM_TYPE) {
+            collision.add_surface_triangle(t.map(|v| col_world.transform_point3(v)), index as u32, cached.material);
+        }
+        // Floors the proxies miss: any visible triangle facing up is something to stand on
+        // (snow drifts drawn as blended layers, the submarine's deck, road ends). Big
+        // structures (the cargo plane, sheds, the sub) also keep their visible walls: their
+        // proxies are coarse and leave gaps 47 could walk through.
+        if e.type_id == STATIC_GEOM_TYPE && !cached.surface.is_empty() {
+            let (lo, hi) = cached.surface.iter().flat_map(|(t, _)| t.iter()).fold((Vec3::MAX, Vec3::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+            let big = (hi - lo).x.max((hi - lo).z) * CM_TO_M > 6.0;
+            for (t, kind) in &cached.surface {
+                let w = t.map(|v| col_world.transform_point3(v));
+                let n = (w[1] - w[0]).cross(w[2] - w[0]).normalize_or_zero();
+                if n.y.abs() > 0.7 || big {
+                    collision.add_surface_triangle(w, index as u32, *kind);
+                }
+            }
+        }
+
         let mut transform = instance_transform(world_rotations[index], world_positions[index]);
         transform.translation.y += lifts.get(&index).copied().unwrap_or(0.0);
-        let world = transform.to_matrix();
-        for t in cached.solid.iter().filter(|_| e.type_id == STATIC_GEOM_TYPE) {
-            collision.add_triangle(t.map(|v| world.transform_point3(v)), index as u32);
-        }
         if cached.parts.is_empty() {
             continue;
         }
 
         positions.push(transform.translation);
+        // `HITMAN_COVERAGE=x,z,r` / `HITMAN_HOLES`: collect drawn triangles (debugging).
+        if coverage.is_some() || holes {
+            let world = transform.to_matrix();
+            if let Ok(model) = level.prm.model(e.primitive) {
+                for sm in model.submeshes.iter().filter(|sm| sm.in_lod0() && !sm.is_proxy() && !hide_tex.contains(&sm.texture)) {
+                    for t in local_triangles(sm) {
+                        drawn.add_triangle(t.map(|v| world.transform_point3(v)), if holes { index as u32 } else { sm.texture });
+                    }
+                }
+            }
+        }
+        // `HITMAN_LIST_TEX=321` logs the entities drawing with that texture (debugging).
+        if let Ok(t) = std::env::var("HITMAN_LIST_TEX") {
+            if cached.parts.iter().any(|(_, k)| t.split(',').any(|x| x.parse() == Ok(k.texture))) {
+                info!("tex user: {} type {:#x} flags {:#x} parent {:?}", e.name, e.type_id, e.flags, parent_indices[index].map(|p| &level.entities[p].name));
+            }
+        }
+        // `HITMAN_LIST_NEAR=x,z,r` logs the meshes placed within r metres of (x, z) (debugging).
+        if let Some(v) = crate::shot::env_vec3("HITMAN_LIST_NEAR") {
+            if transform.translation.xz().distance(Vec2::new(v.x, v.y)) < v.z {
+                let model = level.prm.model(e.primitive).ok();
+                let parts: Vec<String> = model
+                    .iter()
+                    .flat_map(|m| m.submeshes.iter().filter(|sm| sm.in_lod0()))
+                    .map(|sm| format!("tex {} rs {:#x}{}", sm.texture, sm.render_state, if sm.blended { " blended" } else { "" }))
+                    .collect();
+                info!("near: {} at {:.1?} lift {:.3} parts {:?}", e.name, transform.translation.to_array(), lifts.get(&index).copied().unwrap_or(0.0), parts);
+            }
+        }
         if let Some(props) = &e.cloth {
             // Cloth: a private world-space copy of the mesh, held by the anchor boxes.
             let anchors: Vec<(Vec3, Vec3)> = props
@@ -257,6 +332,10 @@ pub fn spawn_level(
             .spawn((transform, Visibility::default(), LevelGeom, Name::new(e.name.clone())))
             .with_children(|c| {
                 for (mesh, key) in cached.parts.iter() {
+                    // `HITMAN_HIDE_TEX=48,39` skips parts using those textures (debugging).
+                    if hide_tex.contains(&key.texture) {
+                        continue;
+                    }
                     let material = material_cache
                         .entry(*key)
                         .or_insert_with(|| materials.add(build_material(&level.tex, *key, images)))
@@ -309,6 +388,8 @@ pub fn spawn_level(
         }
     }
 
+    commands.insert_resource(weapon_models(level, &world_positions, &world_rotations, &parent_indices, meshes, materials, images));
+
     for (ddoor_idx, leaves) in ddoor_leaves {
         let parent_e = &level.entities[ddoor_idx];
         let center_world = glacier_to_bevy(world_positions[ddoor_idx]) + Vec3::Y * 1.0;
@@ -333,6 +414,32 @@ pub fn spawn_level(
         ));
     }
 
+    if holes {
+        report_holes(level, &drawn, collision);
+    }
+    if let Some(c) = coverage {
+        // Top-down map: '#' drawn ground within 1.5 m of y=0, '^' only something higher, '.' nothing.
+        let r = c.z as i32;
+        let mut map = String::new();
+        let mut others: std::collections::BTreeMap<u32, usize> = Default::default();
+        for dz in -r..=r {
+            for dx in -r..=r {
+                let (x, z) = (c.x + dx as f32, c.y + dz as f32);
+                // Topmost drawn surface near the ground, by texture: s = snow 39, g = gravel 48.
+                map.push(match drawn.raycast(Vec3::new(x, 1.5, z), Vec3::NEG_Y, 3.0).map(|h| h.source) {
+                    Some(39) => 's',
+                    Some(48) => 'g',
+                    Some(t) => {
+                        *others.entry(t).or_insert(0) += 1;
+                        char::from(b'A' + (t % 26) as u8)
+                    }
+                    None => '.',
+                });
+            }
+            map.push('\n');
+        }
+        info!("drawn ground coverage around ({}, {}):\n{map}other textures (letter = A + id % 26): {others:?}", c.x, c.y);
+    }
     info!(
         "spawned {} instances of {} models, {} materials, {} collision triangles",
         positions.len(),
@@ -348,6 +455,152 @@ pub fn spawn_level(
     let median = Vec3::new(axis(0), axis(1), axis(2));
     let entity_world: Vec<Vec3> = world_positions.iter().map(|p| glacier_to_bevy(*p)).collect();
     LevelBounds { min, max, median, entity_world }
+}
+
+/// Finds visible floors with no collision under them (where 47 would fall through), on a
+/// 1 m grid, and logs them grouped by the mesh that is drawn there.
+fn report_holes(level: &Level, drawn: &WorldCollision, collision: &WorldCollision) {
+    let (min, max) = collision.bounds();
+    let mut by_entity: HashMap<u32, (usize, Vec3)> = HashMap::new();
+    let mut total = 0;
+    let mut z = min.z.floor();
+    while z < max.z {
+        let mut x = min.x.floor();
+        while x < max.x {
+            // Every upward-facing drawn surface in this column, top to bottom.
+            let mut y = max.y + 1.0;
+            while let Some(h) = drawn.raycast(Vec3::new(x, y, z), Vec3::NEG_Y, y - min.y + 1.0) {
+                let floor = y - h.distance;
+                if h.normal.y.abs() > 0.8 {
+                    let solid = collision.raycast(Vec3::new(x, floor + 0.6, z), Vec3::NEG_Y, 1.2).is_some();
+                    if !solid {
+                        total += 1;
+                        let e = by_entity.entry(h.source).or_insert((0, Vec3::new(x, floor, z)));
+                        e.0 += 1;
+                    }
+                }
+                y = floor - 0.05;
+            }
+            x += 1.0;
+        }
+        z += 1.0;
+    }
+    let mut list: Vec<_> = by_entity.into_iter().collect();
+    list.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    info!("holes: {total} m² of visible floor without collision");
+    for (index, (n, at)) in list.iter().take(40) {
+        let name = level.entities.get(*index as usize).map_or("?", |e| e.name.as_str());
+        info!("  {n:5} m²  {name}  e.g. at {:.1?}", at.to_array());
+    }
+}
+
+/// Surface material of texture `id`, by its name (cached).
+fn surface_of(level: &Level, id: u32, cache: &mut HashMap<u32, Surface>) -> Surface {
+    *cache.entry(id).or_insert_with(|| level.tex.decode(id).ok().flatten().map_or(Surface::default(), |t| Surface::from_texture(&t.name)))
+}
+
+/// Rough area of a submesh (cm²), to find what a model is mostly made of.
+fn area(sm: &prm::SubMesh) -> f32 {
+    sm.triangles
+        .iter()
+        .map(|t| {
+            let p = t.map(|i| Vec3::from(sm.vertices[i as usize].pos));
+            (p[1] - p[0]).cross(p[2] - p[0]).length() * 0.5
+        })
+        .sum()
+}
+
+/// A gun or the fiber wire as the level's template assembles it: parts relative to the
+/// template, and the grip (`PosBox_Hand`) where the hand holds it.
+pub struct WeaponModel {
+    pub parts: Vec<(Handle<Mesh>, Handle<StandardMaterial>, Transform)>,
+    pub grip: Transform,
+}
+
+/// The weapons 47 can hold, by template name.
+#[derive(Resource, Default)]
+pub struct WeaponModels(pub HashMap<String, WeaponModel>);
+
+/// Templates whose models 47 holds.
+const HELD_WEAPONS: [&str; 3] = ["Gun_Hardballer_Silenced_01", "Rifle_AK47_01", "CC_FiberWire_01"];
+
+fn weapon_models(
+    level: &Level,
+    positions: &[[f32; 3]],
+    rotations: &[[[f32; 3]; 3]],
+    parents: &[Option<usize>],
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) -> WeaponModels {
+    let mut out = WeaponModels::default();
+    for name in HELD_WEAPONS {
+        let Some(t) = level.entities.iter().position(|e| e.name == name) else { continue };
+        let to_template = instance_transform(rotations[t], positions[t]).to_matrix().inverse();
+        let relative = |i: usize| Transform::from_matrix(to_template * instance_transform(rotations[i], positions[i]).to_matrix());
+        let mut model = WeaponModel { parts: Vec::new(), grip: Transform::IDENTITY };
+        for (i, e) in level.entities.iter().enumerate().filter(|(i, _)| parents[*i] == Some(t)) {
+            if e.name == "PosBox_Hand" {
+                model.grip = relative(i);
+                continue;
+            }
+            // `FiberWire_Inactive` is the coiled wire; the taut one is drawn when in use.
+            if e.name.starts_with("PosBox") || e.name == "FiberWire_Inactive" || e.primitive == 0 {
+                continue;
+            }
+            let Ok(prm) = level.prm.model(e.primitive) else { continue };
+            for sm in prm.submeshes.iter().filter(|sm| sm.in_lod0() && !sm.is_proxy()) {
+                let material = materials.add(build_material(&level.tex, MaterialKey { texture: sm.texture, blended: sm.blended }, images));
+                model.parts.push((meshes.add(build_mesh(sm)), material, relative(i)));
+            }
+        }
+        info!("weapon model {name}: {} parts", model.parts.len());
+        out.0.insert(name.to_owned(), model);
+    }
+    out
+}
+
+/// Marks the in-game map's floor plans, drawn only by the map camera (`map.rs`).
+#[derive(Component)]
+pub struct MapGeometry;
+
+/// Render layer of the map screen.
+pub const MAP_LAYER: usize = 1;
+
+/// One of the map screen's floor plans: unlit, on the map layer only.
+fn spawn_map_piece(
+    level: &Level,
+    e: &hitman_clone::glacier::gms::Entity,
+    transform: Transform,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) {
+    let Ok(model) = level.prm.model(e.primitive) else { return };
+    let layer = bevy::camera::visibility::RenderLayers::layer(MAP_LAYER);
+    let parent = commands.spawn((transform, Visibility::default(), MapGeometry, layer.clone(), Name::new(e.name.clone()))).id();
+    for sm in model.submeshes.iter().filter(|sm| sm.in_lod0() && !sm.is_proxy()) {
+        let mut material = build_material(&level.tex, MaterialKey { texture: sm.texture, blended: sm.blended }, images);
+        material.unlit = true;
+        material.fog_enabled = false;
+        let child = commands.spawn((Mesh3d(meshes.add(build_mesh(sm))), MeshMaterial3d(materials.add(material)), layer.clone())).id();
+        commands.entity(parent).add_child(child);
+    }
+}
+
+/// Whether `e` belongs to the in-game map screen: named `…MAP_…`, or drawn only with the map's
+/// textures (`HMC_IngameMap_*`). `cache` remembers texture names by id.
+fn is_map_geometry(level: &Level, e: &hitman_clone::glacier::gms::Entity, cache: &mut HashMap<u32, bool>) -> bool {
+    if e.name.contains("MAP_") {
+        return true;
+    }
+    let Ok(model) = level.prm.model(e.primitive) else { return false };
+    let mut textures = model.submeshes.iter().filter(|sm| sm.texture != 0).map(|sm| sm.texture).peekable();
+    textures.peek().is_some()
+        && textures.all(|t| {
+            *cache.entry(t).or_insert_with(|| level.tex.decode(t).ok().flatten().is_some_and(|tex| tex.name.contains("IngameMap")))
+        })
 }
 
 /// Applies `P` (see module docs): PRM vertex space → entity-matrix space.
@@ -395,12 +648,13 @@ fn layer_flats(level: &Level, positions: &[[f32; 3]], rotations: &[[[f32; 3]; 3]
         decal: bool,
     }
     let mut flats = Vec::new();
+    let mut map_textures: HashMap<u32, bool> = HashMap::new();
     for (index, e) in level.entities.iter().enumerate() {
-        if e.type_id != STATIC_GEOM_TYPE || !level.prm.is_record(e.primitive) || e.name.starts_with("MAP_") {
+        if e.type_id != STATIC_GEOM_TYPE || !level.prm.is_record(e.primitive) || is_map_geometry(level, e, &mut map_textures) {
             continue;
         }
         let Ok(model) = level.prm.model(e.primitive) else { continue };
-        let parts: Vec<_> = model.submeshes.iter().filter(|s| s.in_lod0() && s.texture != 0).collect();
+        let parts: Vec<_> = model.submeshes.iter().filter(|s| s.in_lod0() && !s.is_proxy()).collect();
         if parts.is_empty() {
             continue;
         }
@@ -481,7 +735,19 @@ pub(crate) fn build_material(archive: &tex::TexArchive, key: MaterialKey, images
     match archive.decode(id) {
         Ok(Some(t)) => {
             mat.alpha_mode = if key.blended { AlphaMode::Blend } else { cutout_mode(&t.rgba) };
+            if key.blended {
+                // Blended layers (snow over gravel, puddles) lie exactly on the surface beneath;
+                // the original drew them second with a depth test that lets equal depths pass.
+                mat.depth_bias = std::env::var("HITMAN_DECAL_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            }
             mat.base_color_texture = Some(images.add(build_image(&t)));
+            // Vehicle skins (the AN-124 above all) are painted metal: the original gives them an
+            // environment-mapped sheen; a glossy finish lets the moon and the lamps trace the
+            // fuselage's curve instead of leaving a flat slab.
+            if t.name.contains("_VCL_") {
+                mat.perceptual_roughness = 0.32;
+                mat.reflectance = 0.6;
+            }
         }
         Ok(None) => mat.base_color = Color::srgb(0.6, 0.6, 0.6),
         Err(err) => {

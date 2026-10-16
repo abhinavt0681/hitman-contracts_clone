@@ -21,6 +21,41 @@ use hitman_clone::glacier::level::Level;
 /// Night sky and fog: a dark teal that swallows everything past a few dozen metres.
 pub const NIGHT: Color = Color::srgb(0.035, 0.065, 0.08);
 pub const FOG_DENSITY: f32 = 0.028;
+
+/// The overall grade: fog/sky colour, squall whiteout, ambient light, lamp strength and tone
+/// mapping. The default is our own darker night. `HITMAN_LOOK=faithful` matches colours
+/// measured from the original (snow ≈ 56,90,91; fog ≈ 55,85,90 sRGB) with no filmic tone curve,
+/// like its fixed-function pipeline; `mid` sits between.
+pub struct Look {
+    pub night: Color,
+    pub whiteout: Color,
+    pub ambient: f32,
+    /// Scale on lamp intensities: without a tone curve, bright lamps would clip to white.
+    pub lamps: f32,
+    pub tonemapping: bevy::render::view::Tonemapping,
+}
+
+pub fn look() -> &'static Look {
+    use bevy::render::view::Tonemapping;
+    static LOOK: std::sync::OnceLock<Look> = std::sync::OnceLock::new();
+    LOOK.get_or_init(|| match std::env::var("HITMAN_LOOK").as_deref() {
+        Ok("faithful") => Look {
+            night: Color::srgb(0.20, 0.31, 0.33),
+            whiteout: Color::srgb(0.36, 0.47, 0.49),
+            ambient: 700.0,
+            lamps: 0.45,
+            tonemapping: Tonemapping::Linear,
+        },
+        Ok("mid") => Look {
+            night: Color::srgb(0.10, 0.17, 0.19),
+            whiteout: Color::srgb(0.24, 0.33, 0.36),
+            ambient: 320.0,
+            lamps: 0.6,
+            tonemapping: Tonemapping::Linear,
+        },
+        _ => Look { night: NIGHT, whiteout: WHITEOUT, ambient: 120.0, lamps: 1.0, tonemapping: Tonemapping::TonyMcMapface },
+    })
+}
 /// What the fog turns to in a full squall: a grey-teal whiteout lit by the lamps it swallows.
 const WHITEOUT: Color = Color::srgb(0.15, 0.22, 0.245);
 const LIGHT_CLASSES: [u32; 2] = [0x800023, 0x800024];
@@ -31,8 +66,8 @@ pub struct AtmospherePlugin;
 
 impl Plugin for AtmospherePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ClearColor(NIGHT))
-            .insert_resource(GlobalAmbientLight { color: Color::srgb(0.55, 0.75, 0.85), brightness: 120.0, ..default() })
+        app.insert_resource(ClearColor(look().night))
+            .insert_resource(GlobalAmbientLight { color: Color::srgb(0.55, 0.75, 0.85), brightness: look().ambient, ..default() })
             .init_resource::<Gust>()
             .init_resource::<Exposure>()
             .add_systems(Update, (gusts, blink, expose));
@@ -41,7 +76,17 @@ impl Plugin for AtmospherePlugin {
 
 /// Camera components for the night look.
 pub fn camera_bundle() -> impl Bundle {
-    (DistanceFog { color: NIGHT, falloff: FogFalloff::Exponential { density: FOG_DENSITY }, ..default() }, Bloom::NATURAL)
+    use bevy::render::view::Tonemapping;
+    // `HITMAN_TONEMAP=none|neutral|agx|reinhard|tony` for comparisons.
+    let tonemapping = match std::env::var("HITMAN_TONEMAP").as_deref() {
+        Ok("none") => Tonemapping::None,
+        Ok("neutral") => Tonemapping::KhronosPbrNeutral,
+        Ok("agx") => Tonemapping::AgX,
+        Ok("reinhard") => Tonemapping::ReinhardLuminance,
+        Ok("boring") => Tonemapping::SomewhatBoringDisplayTransform,
+        _ => look().tonemapping,
+    };
+    (DistanceFog { color: look().night, falloff: FogFalloff::Exponential { density: FOG_DENSITY }, ..default() }, Bloom::NATURAL, tonemapping)
 }
 
 /// A squall: `strength` ramps 0 → 1 → 0 over a few seconds, every half minute or so.
@@ -126,7 +171,7 @@ pub fn spawn(
         commands.spawn((
             PointLight {
                 color: if inside { FLUORESCENT } else { SODIUM },
-                intensity: if inside { 12_000.0 } else { 140_000.0 },
+                intensity: look().lamps * if inside { 12_000.0 } else { 140_000.0 },
                 range: if inside { 9.0 } else { 14.0 },
                 shadow_maps_enabled: false,
                 ..default()
@@ -147,6 +192,7 @@ pub fn spawn(
             "TailStrobeLight" | "LeftStrobeLight" | "RightStrobeLight" => (Color::WHITE, 1.3, 0.08, 900_000.0),
             _ => continue,
         };
+        let intensity = intensity * look().lamps;
         commands.spawn((
             PointLight { color, intensity, range: 18.0, ..default() },
             Transform::from_translation(bounds.entity_world[i]),
@@ -217,7 +263,7 @@ fn gusts(
 
 /// Fog colour for a squall of `strength` where the camera is.
 pub fn fog_color(strength: f32) -> Color {
-    NIGHT.mix(&WHITEOUT, 0.85 * strength)
+    look().night.mix(&look().whiteout, 0.85 * strength)
 }
 
 /// How lit 47 is, and whether the squall reaches him.

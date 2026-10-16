@@ -14,8 +14,11 @@ mod audio;
 mod character;
 mod cloth;
 mod collision;
+mod flow;
+mod footsteps;
 mod game;
 mod hud;
+mod map;
 mod music;
 mod nav;
 mod player;
@@ -38,8 +41,8 @@ fn main() {
             primary_window: Some(Window { title: "Hitman Contracts clone — The Bjarkhov Bomb".into(), ..default() }),
             ..default()
         }))
-        .add_plugins((atmosphere::AtmospherePlugin, ambience::AmbiencePlugin, snow::SnowPlugin, cloth::ClothPlugin, nav::NavPlugin, music::MusicPlugin))
-        .add_plugins((FreeCameraPlugin, player::PlayerPlugin, character::CharacterPlugin, game::GamePlugin, hud::HudPlugin, shot::ShotPlugin))
+        .add_plugins((atmosphere::AtmospherePlugin, ambience::AmbiencePlugin, footsteps::FootstepsPlugin, snow::SnowPlugin, cloth::ClothPlugin, nav::NavPlugin, music::MusicPlugin))
+        .add_plugins((FreeCameraPlugin, flow::FlowPlugin, map::MapPlugin, player::PlayerPlugin, character::CharacterPlugin, game::GamePlugin, hud::HudPlugin, shot::ShotPlugin))
         .init_resource::<collision::WorldCollision>()
         .add_systems(Startup, (load_level, audio::setup_audio))
         .add_systems(Update, audio::ambience)
@@ -65,6 +68,19 @@ fn load_level(
     };
     info!("{id}: {} entities", level.entities.len());
     let bounds = view::spawn_level(&level, &mut commands, &mut meshes, &mut materials, &mut images, &mut collision);
+    // `HITMAN_PROBE="x,y,z;dx,dy,dz|…"` logs what collision rays hit (debugging).
+    if let Ok(spec) = std::env::var("HITMAN_PROBE") {
+        for ray in spec.split('|') {
+            let v: Vec<f32> = ray.split([',', ';']).filter_map(|s| s.trim().parse().ok()).collect();
+            if v.len() == 6 {
+                let (o, d) = (Vec3::new(v[0], v[1], v[2]), Vec3::new(v[3], v[4], v[5]).normalize());
+                match collision.raycast(o, d, 60.0) {
+                    Some(h) => info!("probe {o} -> {d}: hit {:.2} m, {}", h.distance, level.entities.get(h.source as usize).map_or("?", |e| e.name.as_str())),
+                    None => info!("probe {o} -> {d}: nothing"),
+                }
+            }
+        }
+    }
 
     info!("level bounds {:?}..{:?}, median {:?}", bounds.min, bounds.max, bounds.median);
     // 47's template entity marks where the mission starts.
@@ -118,6 +134,7 @@ fn load_level(
         Transform::from_translation(start + Vec3::new(0.0, 2.0, 3.0)),
         player::orbit_camera(),
         atmosphere::camera_bundle(),
+        IsDefaultUiCamera,
         bevy::audio::SpatialListener::new(0.3),
     ));
     atmosphere::spawn(&level, &bounds, &collision, &mut commands);

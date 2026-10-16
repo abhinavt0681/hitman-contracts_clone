@@ -16,6 +16,7 @@ mod actions;
 mod ai;
 mod doors;
 mod mission;
+pub mod weapons;
 
 pub use ai::Steering;
 pub use doors::{Door, DoorLeaf};
@@ -27,6 +28,7 @@ const EYE: f32 = 1.6;
 pub struct GamePlugin;
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<weapons::Gunplay>();
         app.add_systems(PostStartup, debug_setup.run_if(resource_exists::<Mission>));
         app.add_systems(
             Update,
@@ -34,11 +36,15 @@ impl Plugin for GamePlugin {
                 actor_patrol,
                 perceive,
                 guard_combat,
+                weapons::guard_fire,
                 player_actions,
+                weapons::gun_input,
+                weapons::arm_pose,
                 shoot,
             )
                 .chain()
-                .run_if(resource_exists::<Mission>),
+                .run_if(resource_exists::<Mission>)
+                .run_if(in_state(crate::flow::Phase::Playing)),
         );
         app.add_systems(
             Update,
@@ -51,8 +57,11 @@ impl Plugin for GamePlugin {
                 messages_tick,
                 restart,
                 log_minds,
+                weapons::fade_flashes,
+                weapons::hold_models,
             )
-                .run_if(resource_exists::<Mission>),
+                .run_if(resource_exists::<Mission>)
+                .run_if(in_state(crate::flow::Phase::Playing)),
         );
     }
 }
@@ -130,6 +139,14 @@ pub struct Actor {
     /// The idle clip to go back to after aiming.
     calm_idle: Option<String>,
     fire_cooldown: f32,
+    /// Rounds left in the current burst.
+    burst: u8,
+    /// Seconds spent sighting 47 down the rifle before the first burst (reaction time).
+    sighting: f32,
+    /// `m_iHitpoints`: 20 for everyone in the original.
+    pub health: f32,
+    /// A soldier whose AK-47 47 has taken.
+    pub disarmed: bool,
 }
 /// A guard's state of mind short of open hostility.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -167,7 +184,7 @@ impl Actor {
             Outfit::Soldier | Outfit::Bodyguard => Kind::Guard,
             _ => Kind::Civilian,
         };
-        Self { name: name.to_owned(), kind, outfit, alive: true, stripped: false, found: false, suspicion: 0.0, alerted: false, mind: Mind::Calm, last_seen: None, lost_for: 0.0, calm_idle: None, fire_cooldown: 0.0 }
+        Self { name: name.to_owned(), kind, outfit, alive: true, stripped: false, found: false, suspicion: 0.0, alerted: false, mind: Mind::Calm, last_seen: None, lost_for: 0.0, calm_idle: None, fire_cooldown: 0.0, burst: 0, sighting: 0.0, health: 20.0, disarmed: false }
     }
 }
 /// A patrol route from the level's path data: nodes with optional pauses. Routes whose ends
@@ -218,6 +235,8 @@ pub enum Item {
     SilencedPistol,
     PoisonVial,
     BombRemote,
+    /// A guard's AK-47, once taken.
+    AssaultRifle,
 }
 impl Item {
     pub fn label(self) -> &'static str {
@@ -227,6 +246,7 @@ impl Item {
             Item::SilencedPistol => "Silenced Silverballer",
             Item::PoisonVial => "Cyanide Poison",
             Item::BombRemote => "Bomb Remote Detonator",
+            Item::AssaultRifle => "AK-47",
         }
     }
 }
@@ -263,6 +283,10 @@ pub struct Mission {
     /// Sounds guards may come to check this frame: where, and how far they carry.
     pub noises: Vec<(Vec3, f32)>,
     pub active_item: Item,
+    /// Silverballer rounds: in the gun and spare magazines.
+    pub pistol: weapons::Ammo,
+    /// The AK-47, if 47 has taken one from a dead soldier.
+    pub rifle: Option<weapons::Ammo>,
     pub tnt: u32,
     pub sub_bombs_placed: u32,
     pub soup_poisoned: bool,
@@ -292,6 +316,8 @@ impl Mission {
             disguise_unit: None,
             noises: Vec::new(),
             active_item: Item::Holstered,
+            pistol: weapons::Ammo { loaded: weapons::SILVERBALLER.magazine, spare: weapons::SILVERBALLER.magazine * 3 },
+            rifle: None,
             tnt: 0,
             sub_bombs_placed: 0,
             soup_poisoned: false,
@@ -386,16 +412,9 @@ fn messages_tick(time: Res<Time>, mut mission: ResMut<Mission>) {
 }
 /// Enter after the mission ends restarts the game process (simplest full reset).
 fn restart(keys: Res<ButtonInput<KeyCode>>, mission: Res<Mission>, mut exit: MessageWriter<AppExit>) {
-    if mission.outcome.is_none() || !keys.just_pressed(KeyCode::Enter) {
-        return;
+    if mission.outcome.is_some() && keys.just_pressed(KeyCode::Enter) {
+        crate::flow::restart_process(&mut exit);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).args(std::env::args().skip(1)).spawn();
-    }
-    exit.write(AppExit::Success);
-}
-pub fn outfit_label(o: Outfit) -> &'static str {
-    o.label()
 }
 /// Test hooks: `HITMAN_BEHIND=<actor name>` starts 47 a metre behind that actor;
 /// `HITMAN_OUTFIT=Soldier|BombWorker|…` starts him in that outfit (no model swap).
@@ -429,6 +448,10 @@ fn debug_setup(
             "SilencedPistol" => Item::SilencedPistol,
             "PoisonVial" => Item::PoisonVial,
             "BombRemote" => Item::BombRemote,
+            "AssaultRifle" => {
+                mission.rifle = Some(weapons::Ammo { loaded: 30, spare: 60 });
+                Item::AssaultRifle
+            }
             _ => Item::Holstered,
         };
     }

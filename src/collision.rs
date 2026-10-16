@@ -14,6 +14,8 @@ pub struct WorldCollision {
     tris: Vec<[Vec3; 3]>,
     /// Index of the GMS entity each triangle came from, for debugging what you bumped into.
     source: Vec<u32>,
+    /// What each triangle is made of, for footsteps and bullet impacts.
+    surface: Vec<Surface>,
     grid: HashMap<(i32, i32), Vec<u32>>,
     disabled_sources: HashSet<u32>,
 }
@@ -21,6 +23,48 @@ pub struct WorldCollision {
 pub struct Hit {
     pub distance: f32,
     pub normal: Vec3,
+    /// Source id of the triangle hit (the GMS entity, unless the builder chose otherwise).
+    pub source: u32,
+    pub surface: Surface,
+}
+
+/// Material of a surface, from its texture name; picks step and impact sounds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Surface {
+    #[default]
+    Snow,
+    Gravel,
+    Concrete,
+    Steel,
+    Wood,
+    Carpet,
+    Water,
+    Dirt,
+}
+
+impl Surface {
+    /// From a texture name such as `HMC_C2_Metal_12a` or `HMC_C2_Ground_14a`.
+    pub fn from_texture(name: &str) -> Self {
+        let n = name.to_ascii_lowercase();
+        let has = |k: &str| n.contains(k);
+        if has("water") || has("liquid") {
+            Surface::Water
+        } else if has("ground_14") || has("gravel") || has("pebble") {
+            Surface::Gravel
+        } else if has("dirt") {
+            Surface::Dirt
+        } else if has("metal") || has("submarine") || has("planetransport") || has("trolley") || has("steel") || has("grate") {
+            Surface::Steel
+        } else if has("wood") || has("board") || has("plank") {
+            Surface::Wood
+        } else if has("fabric") || has("cloth") || has("carpet") {
+            Surface::Carpet
+        } else if has("stone") || has("concrete") || has("tile") || has("ceramic") {
+            Surface::Concrete
+        } else {
+            Surface::Snow
+        }
+    }
 }
 
 fn cell_of(v: f32) -> i32 {
@@ -29,6 +73,10 @@ fn cell_of(v: f32) -> i32 {
 
 impl WorldCollision {
     pub fn add_triangle(&mut self, t: [Vec3; 3], source: u32) {
+        self.add_surface_triangle(t, source, Surface::Snow);
+    }
+
+    pub fn add_surface_triangle(&mut self, t: [Vec3; 3], source: u32, surface: Surface) {
         let n = (t[1] - t[0]).cross(t[2] - t[0]);
         if n.length_squared() < 1e-10 {
             return;
@@ -42,6 +90,7 @@ impl WorldCollision {
         let id = self.tris.len() as u32;
         self.tris.push(t);
         self.source.push(source);
+        self.surface.push(surface);
         for x in cell_of(min.x)..=cell_of(max.x) {
             for z in cell_of(min.z)..=cell_of(max.z) {
                 self.grid.entry((x, z)).or_default().push(id);
@@ -191,12 +240,13 @@ impl WorldCollision {
             let inv = 1.0 / det;
             let s = origin - a;
             let u = s.dot(p) * inv;
-            if !(0.0..=1.0).contains(&u) {
+            const EPS: f32 = 1e-4;
+            if u < -EPS || u > 1.0 + EPS {
                 continue;
             }
             let q = s.cross(e1);
             let v = dir.dot(q) * inv;
-            if v < 0.0 || u + v > 1.0 {
+            if v < -EPS || u + v > 1.0 + EPS {
                 continue;
             }
             let t = e2.dot(q) * inv;
@@ -205,7 +255,7 @@ impl WorldCollision {
                 if normal.dot(dir) > 0.0 {
                     normal = -normal;
                 }
-                best = Some(Hit { distance: t, normal });
+                best = Some(Hit { distance: t, normal, source: self.source[id as usize], surface: self.surface[id as usize] });
             }
         }
         best

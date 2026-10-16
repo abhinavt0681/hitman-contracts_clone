@@ -24,7 +24,7 @@ const CLEARANCE: f32 = 0.3;
 /// Floors per cell beyond which the rest are ignored.
 const MAX_FLOORS: usize = 6;
 const MIN_FLOOR_NY: f32 = 0.6;
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 4;
 
 const DIRS: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
 

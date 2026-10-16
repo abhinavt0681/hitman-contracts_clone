@@ -22,8 +22,11 @@ use crate::nav::NavGrid;
 pub(super) const VIEW_RANGE: f32 = 30.0;
 /// …and only this close when he keeps to the dark.
 const DARK_RANGE: f32 = 9.0;
-/// A full squall takes this share off sight and hearing outdoors.
-const GUST_SIGHT: f32 = 0.45;
+/// Outdoors the blizzard is a wall: past this nobody is made out, lamp or no lamp…
+const WHITEOUT: f32 = 22.0;
+/// …and in a full squall, past this.
+const SQUALL_WHITEOUT: f32 = 6.0;
+/// A full squall takes this share off hearing outdoors.
 const GUST_HEARING: f32 = 0.6;
 
 /// Half-angle of a guard's vision cone.
@@ -35,7 +38,6 @@ pub(super) const ALARM_SPREAD: f32 = 35.0;
 
 pub(super) const RIFLE_RANGE: f32 = 22.0;
 
-pub(super) const RIFLE_DPS: f32 = 14.0;
 
 pub(super) const GUARD_RUN_SPEED: f32 = 4.0;
 const GUARD_WALK_SPEED: f32 = 1.3;
@@ -126,12 +128,15 @@ pub(super) fn perceive(
     let feet = pt.translation();
     let target = if player.crouching { feet + Vec3::Y * 0.75 } else { feet + Vec3::Y * 1.2 };
     let running = player.speed() > 2.5;
-    // Fiber wire, poison and the remote stay hidden in a pocket; only a drawn gun is visible.
-    let drawn_weapon = mission.active_item == Item::SilencedPistol;
+    // Fiber wire, poison and the remote stay hidden in a pocket; a drawn gun is visible. A
+    // soldier carrying his unit's AK-47 is nothing unusual.
+    let drawn_weapon = mission.active_item == Item::SilencedPistol || (mission.active_item == Item::AssaultRifle && mission.outfit != Outfit::Soldier);
     let is_dragging = mission.dragging_body.is_some();
-    // Lamps and squalls: in the dark guards make 47 out only close up, and a squall blinds and
-    // deafens them for a few seconds.
-    let sight = DARK_RANGE.lerp(VIEW_RANGE, exposure.light) * (1.0 - GUST_SIGHT * exposure.gust);
+    // Lamps and the blizzard: in the dark guards make 47 out only close up; outdoors the snow
+    // hides him past `WHITEOUT` (a hunting guard too), and a squall blinds and deafens them
+    // for a few seconds.
+    let whiteout = if exposure.indoors { f32::INFINITY } else { WHITEOUT.lerp(SQUALL_WHITEOUT, exposure.gust) };
+    let sight = DARK_RANGE.lerp(VIEW_RANGE, exposure.light).min(whiteout);
     let hearing = 1.0 - GUST_HEARING * exposure.gust;
 
     let bodies: Vec<(Entity, Vec3, String)> = actors
@@ -151,7 +156,7 @@ pub(super) fn perceive(
         // Bodies in view.
         for (body, pos, name) in &bodies {
             let to = *pos + Vec3::Y * 0.4 - eye;
-            if to.length() < BODY_SPOT_RANGE && fwd.angle_between(to.with_y(0.0)) < VIEW_HALF_ANGLE && line_of_sight(&world, eye, *pos + Vec3::Y * 0.4) {
+            if to.length() < BODY_SPOT_RANGE.min(whiteout) && fwd.angle_between(to.with_y(0.0)) < VIEW_HALF_ANGLE && line_of_sight(&world, eye, *pos + Vec3::Y * 0.4) {
                 found_bodies.push((*body, name.clone()));
                 a.alerted = true;
                 a.last_seen = Some(*pos);
@@ -173,7 +178,7 @@ pub(super) fn perceive(
             dist < 1.8 * hearing
         };
         // Hunting guards scan all around; and anyone sees a man walking into him.
-        let range = if a.alerted { sight.max(HUNT_SIGHT) } else { sight }.max(2.5);
+        let range = if a.alerted { sight.max(HUNT_SIGHT.min(whiteout)) } else { sight }.max(2.5);
         let visible = dist < range && (in_cone || heard_behind || a.alerted) && line_of_sight(&world, eye, target);
         if a.alerted {
             if visible {
@@ -311,20 +316,16 @@ pub(super) fn guard_combat(
     time: Res<Time>,
     world: Res<WorldCollision>,
     nav: Option<Res<NavGrid>>,
-    exposure: Res<Exposure>,
-    mut mission: ResMut<Mission>,
-    player: Query<(&GlobalTransform, &Player)>,
+    mission: Res<Mission>,
+    player: Query<&GlobalTransform, With<Player>>,
     mut actors: Query<(&mut Transform, &GlobalTransform, &mut Actor, Option<&mut Gait>, &mut Steering)>,
 ) {
     if mission.outcome.is_some() {
         return;
     }
     let dt = time.delta_secs();
-    let Ok((pt, player)) = player.single() else { return };
+    let Ok(pt) = player.single() else { return };
     let target = pt.translation();
-    // A running man in the dark, in a squall, is hard to hit.
-    let hit_chance = (if player.speed() > 2.5 { 0.5 } else { 1.0 }) * (0.55 + 0.45 * exposure.light) * (1.0 - 0.3 * exposure.gust);
-    let mut damage = 0.0;
     for (mut t, gt, mut a, gait, mut steering) in &mut actors {
         if !a.alive || !a.alerted || a.kind != Kind::Guard {
             continue;
@@ -344,12 +345,7 @@ pub(super) fn guard_combat(
             if gait.idle != "Shoot_Pose_Rifle01" {
                 a.calm_idle = Some(std::mem::replace(&mut gait.idle, "Shoot_Pose_Rifle01".to_owned()));
             }
-            a.fire_cooldown -= dt;
-            if a.fire_cooldown <= 0.0 {
-                a.fire_cooldown = 0.25;
-            }
-            // Accuracy falls off with range.
-            damage += RIFLE_DPS * hit_chance * (1.0 - dist / RIFLE_RANGE).clamp(0.2, 1.0) * dt;
+            // `weapons::guard_fire` pulls the trigger.
             continue;
         }
         if let Some(idle) = a.calm_idle.take() {
@@ -365,7 +361,6 @@ pub(super) fn guard_combat(
             a.mind = Mind::Search { centre: goal, spot: goal, left: SEARCH_SPOTS + 1, linger: LINGER };
         }
     }
-    mission.health -= damage;
 }
 
 /// A random walkable spot within `SEARCH_RADIUS` of `centre`, reachable from `from`.

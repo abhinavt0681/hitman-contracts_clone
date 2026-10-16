@@ -23,8 +23,6 @@ pub struct SoundBank {
     pub gun_holster: Handle<AudioSource>,
     pub fuchs_want_soup: Handle<AudioSource>,
     pub fuchs_poisoned: Handle<AudioSource>,
-    pub step_snow: [Handle<AudioSource>; 3],
-    pub step_steel: [Handle<AudioSource>; 2],
     pub clothes_touch: Handle<AudioSource>,
     pub body_drag: Handle<AudioSource>,
     pub body_drop: Handle<AudioSource>,
@@ -35,6 +33,25 @@ pub struct SoundBank {
     pub bjarkhov_welcome: Handle<AudioSource>,
     pub bjarkhov_drink_vodka: Handle<AudioSource>,
     pub base_alarm: Handle<AudioSource>,
+    pub rifle_shot: Handle<AudioSource>,
+    pub rifle_clip_out: Handle<AudioSource>,
+    pub rifle_clip_in: Handle<AudioSource>,
+    pub rifle_chamber: Handle<AudioSource>,
+    pub pistol_clip_out: Handle<AudioSource>,
+    pub pistol_clip_in: Handle<AudioSource>,
+    pub pistol_chamber: Handle<AudioSource>,
+    pub empty_click: Handle<AudioSource>,
+    pub pickup_gun: Handle<AudioSource>,
+    /// Bullet impacts by surface, and in flesh.
+    pub impacts: std::collections::HashMap<crate::collision::Surface, Vec<Handle<AudioSource>>>,
+    pub impact_flesh: Vec<Handle<AudioSource>>,
+    /// Soldiers' pain and death cries.
+    pub pain_cries: Vec<Handle<AudioSource>>,
+    pub death_cries: Vec<Handle<AudioSource>>,
+    /// Six variations of footstep per surface.
+    pub steps: std::collections::HashMap<crate::collision::Surface, Vec<Handle<AudioSource>>>,
+    /// Diana's briefing lines, by `.LOC` key (`flow::DIANA`).
+    pub voices: std::collections::HashMap<&'static str, Handle<AudioSource>>,
     /// What the level's sound emitters play, by bank name (`ambience::VOICES`).
     pub ambient: std::collections::HashMap<&'static str, Handle<AudioSource>>,
 }
@@ -92,8 +109,6 @@ pub fn setup_audio(mut commands: Commands, mut audio_assets: ResMut<Assets<Audio
         gun_holster: load("Gun_Holster_01"),
         fuchs_want_soup: load("02-1_FOS_01Fuchs"),
         fuchs_poisoned: load("02-1_FS_01Fuchs"),
-        step_snow: ["Step_SnowNew_01", "Step_SnowNew_02", "Step_SnowNew_03"].map(&mut load),
-        step_steel: ["Step_Steel_01", "Step_Steel_02"].map(&mut load),
         clothes_touch: load("Clothes_NormalTouch_01"),
         body_drag: load("Body_Drag_01"),
         body_drop: load("Drop_BodySnow_01"),
@@ -106,6 +121,33 @@ pub fn setup_audio(mut commands: Commands, mut audio_assets: ResMut<Assets<Audio
         bjarkhov_drink_vodka: load("C02-1_B_01CB"),
         // "Alarm. Get to your posts. We have an intruder. Alarm."
         base_alarm: load("02-1_LS_09Alarm"),
+        rifle_shot: load("W_AK47_Shot_01"),
+        rifle_clip_out: load("W_AK47_ClipOut"),
+        rifle_clip_in: load("W_AK47_ClipIn"),
+        rifle_chamber: load("W_AK47_Chamber"),
+        pistol_clip_out: load("W_HardBaller_ClipOut_01"),
+        pistol_clip_in: load("W_HardBaller_ClipIn_01"),
+        pistol_chamber: load("W_HardBaller_Chamber_01"),
+        empty_click: load("W_Empty_01"),
+        pickup_gun: load("PickUp_Gun_01"),
+        impacts: {
+            use crate::collision::Surface::*;
+            [(Snow, "Snow", 6), (Gravel, "Gravel", 6), (Concrete, "Stone", 6), (Steel, "Metal", 7), (Wood, "Wood", 4), (Carpet, "Cloth", 3), (Water, "Water", 4), (Dirt, "Gravel", 6)]
+                .into_iter()
+                .map(|(s, name, n)| (s, (1..=n).map(|i| load(&format!("Impact_{name}_{i:02}"))).collect()))
+                .collect()
+        },
+        impact_flesh: (1..=5).map(|i| load(&format!("Impact_Flesh_{i:02}"))).collect(),
+        pain_cries: (1..=5).map(|i| load(&format!("Pain_E_M1_{i:02}"))).collect(),
+        death_cries: (1..=5).map(|i| load(&format!("Die_E_M1_{i:02}"))).collect(),
+        steps: {
+            use crate::collision::Surface::*;
+            [(Snow, "SnowNew"), (Gravel, "Gravel"), (Concrete, "Concrete"), (Steel, "Steel"), (Wood, "WoodenFloor"), (Carpet, "Carpet"), (Water, "Water"), (Dirt, "Dirt")]
+                .into_iter()
+                .map(|(s, name)| (s, (1..=6).map(|i| load(&format!("Step_{name}_{i:02}"))).collect()))
+                .collect()
+        },
+        voices: crate::flow::DIANA.iter().map(|&k| (k, load(k))).collect(),
         ambient: crate::ambience::VOICES.iter().map(|v| (v.sound, load(v.sound))).collect(),
     };
 

@@ -42,7 +42,7 @@ Most entries are stored; some are deflated. `_Load.ZIP` holds the loading-screen
 | 0x0E | u16 | vertex count |
 | 0x10 | u32 | model-info block shared by all sub-meshes; bbox max xyz at +0x20, min at +0x2C |
 | 0x14 | u32 | vertices: 36 bytes each — pos f32×3, normal f32×3, BGRA u8×4, uv f32×2 |
-| 0x20 | u32 | render state; bits 0xC000 mark collision proxies (not decoded further) |
+| 0x20 | u32 | render state; bit 0x800000 marks proxies that are never drawn (untextured hulls, and textured stand-ins such as the box inside the AN-124 fuselage or second copies of walkway and mess-hall floors); bits 0xC000 also mark untextured collision hulls; the rest is not decoded |
 | 0x34 | u32 | index block: `u16 prim_count`, then per prim `u16 n, u16 idx[n]` |
 | 0x38 | u32 | index block length in u16 words |
 
@@ -165,9 +165,55 @@ Recovered from `ZAnimFilePack` in `HitmanContracts.exe` (vtable 0x72D0C4, loader
   maps them to subtitles (`C02-1_BGHM_01CB` = "So good to meet you at last Fabian…"); the base PA
   is `02-1_LS_01..09` (news, weather, the intruder alarm).
 
+## OCT: spatial physics octrees
+
+Reverse-engineered from `HitmanContracts.exe` (vtable `0x00715cd0` `ZTree`, vtable `0x0073e518` collision manager):
+- Scene loader: `0x00425750` (entity groups), `0x00425814` (global trees), `0x00425855` (spatial links).
+- Entity tree group loader: `0x00456030` (`ZTreeGroup::Load`, 5 tree slots per entity).
+- Octree loader: `0x00629a30` (`ZTree::Load`).
+- Global tree loader: `0x006e3dd0` (method `+0x54`).
+- Spatial links loader: `0x006e3370` (method `+0x48`).
+- Node traverser & ray-triangle intersection: `0x006292f0`, `0x006e2590`, `0x006e36d0`, `0x006e4140`.
+
+An `.OCT` file consists of three sequential sections:
+
+### 1. Entity tree groups
+- Starts at offset `0x10` (after a 16-byte file header).
+- Loops over scene entities derived from `ZTreeGroup` (`0x2003e9` / `0x100020`).
+- Each group has **5 tree slots**:
+  - **Empty slot** (`size == 0`): 16 bytes (`size: u32 = 0`, plus 12 padding bytes).
+  - **Non-empty slot** (`size > 0`):
+    - `+0x00`: `u32 size` (payload size).
+    - `+0x04`: 28-byte outer bounding header (`scale`, `origin` xyz, extra padding).
+    - `+0x20`: payload of `size` bytes.
+    - Slot advances by `32 + ((size + 15) & !15)`.
+
+### 2. Octree payload layout
+Both entity trees and global trees decode their payload (`+0x20` onwards) with `ZTree::Load`:
+- `+0x00`: `u32 poly_table_rel` (byte offset from payload start to polygon table; always 16-byte aligned).
+- `+0x04`: `[f32; 3] origin` (world origin in cm).
+- `+0x10`: `f32 inv_scale` (scale factor `scale = 1.0 / inv_scale`).
+- `+0x14`: **Node table** (`poly_table_rel - 0x14` bytes, 6 bytes per node, padded to 16 bytes before poly table):
+  - `+0x00`: `u16 flags_and_count` (`(fc >> 3) & 0xfff` polygon count, `fc & 7` octant mask).
+  - `+0x02`: `u16 child_index` (index of first child node in node table; 0 = leaf node).
+  - `+0x04`: `u16 poly_start` (start index in polygon table).
+- `+poly_table_rel`: **Polygon table** (`(payload.len() - poly_table_rel) / 16` entries, 16 bytes each):
+  - `+0x00`: `u32 poly_ref` (packed PRM submesh index and triangle index).
+  - `+0x04`: `[u16; 3] min_q` (quantized min XYZ centered at 32768).
+  - `+0x0a`: `[u16; 3] max_q` (quantized max XYZ centered at 32768).
+  - Quantization formula: `world = origin + (q - 32768.0) * scale`.
+
+### 3. Global scene octrees
+- Follows the entity tree groups.
+- Each entry has `u32 total_size` followed by a 28-byte header and octree payload at `+0x20`.
+- Advances directly by `total_size` bytes per chunk until `size == 0xffffffff`.
+
+### 4. Spatial link table
+- Extends from the `0xffffffff` terminator to EOF.
+- Array of **8-byte records**: `u32 poly_ref, u32 primitive_id/offset`.
+- Maps octree polygon references to concrete PRM submesh models for exact triangle vertex lookup.
+
 ## Not yet decoded
 
-- `OCT`: collision octree (quantized; origin + 0.49 scale in the header). The clone currently
-  collides against render meshes, collision proxies and `Coli*` hulls instead.
 - `AMS`, `SND`, `ZGF`/`SGP`/`RMC`/`RMI`/`SUP`, light colour/radius, and the `.sdl` scripts that
   drive AI and cutscenes.

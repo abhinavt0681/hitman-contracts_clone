@@ -4,7 +4,7 @@
 use crate::{
     character::{self, AnimLibrary, Animator, CharacterAssets, Gait},
     collision::WorldCollision,
-    player::{OrbitCamera, Player},
+    player::Player,
 };
 use bevy::{
     input::mouse::MouseButton,
@@ -14,9 +14,6 @@ use bevy::{
 
 use super::*;
 
-pub(super) const GUNSHOT_HEARING: f32 = 30.0;
-/// Guards this close to a silenced shot know it for what it is.
-pub(super) const GUNSHOT_ALARM: f32 = 5.0;
 /// A body dropped in the snow carries this far (m).
 pub(super) const BODY_DROP_HEARING: f32 = 7.0;
 
@@ -41,18 +38,15 @@ pub(super) fn player_actions(
     mut assets: (ResMut<Assets<Mesh>>, ResMut<Assets<StandardMaterial>>, ResMut<Assets<Image>>, ResMut<Assets<SkinnedMeshInverseBindposes>>),
     player: Query<(&GlobalTransform, &Player)>,
     mut actors: Query<(Entity, &GlobalTransform, &mut Actor, &mut Animator)>,
-    mut player_anim: Query<&mut Animator, Without<Actor>>,
+    (mut player_anim, mut actor_transforms): (Query<&mut Animator, Without<Actor>>, Query<&mut Transform, (With<Actor>, Without<Player>)>),
     mut doors: Query<&mut Door>,
 ) {
     let (keys, mouse_scroll) = (&inputs.0, &inputs.1);
     // Weapon / Item switching with keys 1..=5 and mouse wheel
-    let items = [
-        Item::Holstered,
-        Item::FiberWire,
-        Item::SilencedPistol,
-        Item::PoisonVial,
-        Item::BombRemote,
-    ];
+    let mut items = vec![Item::Holstered, Item::FiberWire, Item::SilencedPistol, Item::PoisonVial, Item::BombRemote];
+    if mission.rifle.is_some() {
+        items.push(Item::AssaultRifle);
+    }
     let mut switch = if keys.just_pressed(KeyCode::Digit1) {
         Some(Item::Holstered)
     } else if keys.just_pressed(KeyCode::Digit2) {
@@ -63,6 +57,8 @@ pub(super) fn player_actions(
         Some(Item::PoisonVial)
     } else if keys.just_pressed(KeyCode::Digit5) {
         Some(Item::BombRemote)
+    } else if keys.just_pressed(KeyCode::Digit6) && mission.rifle.is_some() {
+        Some(Item::AssaultRifle)
     } else {
         None
     };
@@ -125,9 +121,9 @@ pub(super) fn player_actions(
         .map(|(e, t, a, _)| (e, t.translation().distance(me), t, a))
         .filter(|(_, d, _, _)| *d < REACH)
         .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(e, _, t, a)| (e, *t, a.alive, a.stripped, a.outfit, a.kind, a.name.clone()));
+        .map(|(e, _, t, a)| (e, *t, a.alive, a.stripped, a.outfit, a.kind, a.name.clone(), a.disarmed));
 
-    if let Some((e, t, alive, stripped, outfit, kind, name)) = near {
+    if let Some((e, t, alive, stripped, outfit, kind, name, disarmed)) = near {
         let (_, fwd) = npc_view(&t);
         let behind = fwd.dot((me - t.translation()).with_y(0.0).normalize_or_zero()) < -0.2;
         if alive && behind {
@@ -142,45 +138,72 @@ pub(super) fn player_actions(
                 }
             }
             if use_key {
-                if let Some(sb) = &sound_bank {
-                    if is_poison {
+                // Anyone watching sees the kill.
+                let spot = t.translation();
+                let seen = actors.iter().any(|(o, ot, oa, _)| {
+                    o != e && oa.alive && oa.kind == Kind::Guard && {
+                        let (eye, f) = npc_view(ot);
+                        let to = spot + Vec3::Y - eye;
+                        to.length() < 20.0 && f.angle_between(to.with_y(0.0)) < VIEW_HALF_ANGLE && line_of_sight(&world, eye, spot + Vec3::Y)
+                    }
+                });
+                if is_poison {
+                    if let Some(sb) = &sound_bank {
                         crate::audio::play_sound(&mut commands, &sb.clothes_touch, 0.6);
-                    } else {
-                        crate::audio::play_sound(&mut commands, &sb.fiber_wire, 0.7);
                     }
-                }
-                if let Ok((_, gt, mut a, mut anim)) = actors.get_mut(e) {
-                    a.alive = false;
-                    let clip = lib.first_of(anim.set(), &["Die_Throat_Cut_Alt_01", "Die_Forward"]).unwrap_or_default();
-                    anim.play_once_at(&clip, 2.5);
-                    commands.entity(e).remove::<Gait>();
-                    // Anyone watching sees the kill.
-                    let spot = gt.translation();
-                    if actors.iter().any(|(o, ot, oa, _)| {
-                        o != e && oa.alive && oa.kind == Kind::Guard && {
-                            let (eye, f) = npc_view(ot);
-                            let to = spot + Vec3::Y - eye;
-                            to.length() < 20.0 && f.angle_between(to.with_y(0.0)) < VIEW_HALF_ANGLE && line_of_sight(&world, eye, spot + Vec3::Y)
-                        }
-                    }) {
-                        raise_alarm(Some(&mut commands), sound_bank.as_deref(), &mut mission, &text, None);
+                    if let Ok((_, _, mut a, mut anim)) = actors.get_mut(e) {
+                        a.alive = false;
+                        let clip = lib.first_of(anim.set(), &["Die_Throat_Cut_Alt_01", "Die_Forward"]).unwrap_or_default();
+                        anim.play_once_at(&clip, 2.5);
+                        commands.entity(e).remove::<Gait>();
                     }
+                    if let Ok(mut anim) = player_anim.get_mut(player.model()) {
+                        anim.play_once("Cut_Throat");
+                    }
+                    mission.busy = 1.6;
+                    on_kill(&mut mission, &text, kind, &name);
+                } else if let (Ok((_, _, mut a, mut anim)), Ok(mut vt)) = (actors.get_mut(e), actor_transforms.get_mut(e)) {
+                    let hitman = player_anim.get_mut(player.model()).ok();
+                    weapons::strangle(&mut commands, &lib, sound_bank.as_deref(), &mut mission, &text, pt, hitman.map(|h| h.into_inner()), e, &mut a, &mut anim, &mut vt);
                 }
-                if let Ok(mut anim) = player_anim.get_mut(player.model()) {
-                    anim.play_once("Cut_Throat");
+                if seen {
+                    raise_alarm(Some(&mut commands), sound_bank.as_deref(), &mut mission, &text, None);
                 }
-                mission.busy = 1.6;
-                on_kill(&mut mission, &text, kind, &name);
             }
             return;
         }
 
         if !alive && mission.dragging_body.is_none() {
             let can_take = !stripped && outfit.templates().0.is_some_and(|t| wardrobe.0.contains_key(t)) && outfit != mission.outfit;
+            // Soldiers carry AK-47s (their `WeaponTemplate`).
+            let has_rifle = outfit == Outfit::Soldier && !disarmed;
+            let mut prompt = String::new();
             if can_take {
-                mission.prompt = Some(format!("[E] Take outfit: {}   |   [G] Drag body", outfit.label()));
-            } else {
-                mission.prompt = Some("[G] Drag body".to_owned());
+                prompt += &format!("[E] Take outfit: {}   |   ", outfit.label());
+            }
+            if has_rifle {
+                prompt += "[F] Take AK-47   |   ";
+            }
+            prompt += "[G] Drag body";
+            mission.prompt = Some(prompt);
+
+            if has_rifle && keys.just_pressed(KeyCode::KeyF) {
+                let ammo = mission.rifle.get_or_insert(weapons::Ammo { loaded: 0, spare: 0 });
+                if ammo.loaded == 0 {
+                    ammo.loaded = weapons::AK47.magazine;
+                } else {
+                    ammo.spare += weapons::AK47.magazine;
+                }
+                ammo.spare += weapons::AK47.magazine;
+                mission.active_item = Item::AssaultRifle;
+                mission.say("Took the AK-47 [6]");
+                if let Ok((_, _, mut a, _)) = actors.get_mut(e) {
+                    a.disarmed = true;
+                }
+                if let Some(sb) = &sound_bank {
+                    crate::audio::play_sound(&mut commands, &sb.pickup_gun, 0.7);
+                }
+                return;
             }
 
             if keys.just_pressed(KeyCode::KeyG) {
@@ -437,14 +460,12 @@ pub(super) fn shoot(
     mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
-    world: Res<WorldCollision>,
     text: Res<Text>,
     lib: Res<AnimLibrary>,
     sound_bank: Option<Res<crate::audio::SoundBank>>,
     anchors: Res<Anchors>,
     mut mission: ResMut<Mission>,
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
-    camera: Query<&GlobalTransform, With<OrbitCamera>>,
     player: Query<&GlobalTransform, With<Player>>,
     mut actors: Query<(Entity, &GlobalTransform, &mut Actor, &mut Animator)>,
 ) {
@@ -488,58 +509,4 @@ pub(super) fn shoot(
         return;
     }
 
-    if mission.active_item != Item::SilencedPistol {
-        return;
-    }
-
-    let Ok(cam) = camera.single() else { return };
-    let (origin, dir) = (cam.translation(), cam.forward().as_vec3());
-
-    if let Some(sb) = &sound_bank {
-        crate::audio::play_sound(&mut commands, &sb.shot_silenced, 0.75);
-    }
-
-    let wall = world.raycast(origin, dir, 200.0).map_or(200.0, |h| h.distance);
-    // Ray against a capsule-ish target: closest approach to the actor's spine.
-    let hit = actors
-        .iter()
-        .filter(|(_, _, a, _)| a.alive)
-        .filter_map(|(e, t, _, _)| {
-            let base = t.translation();
-            (0..4)
-                .filter_map(|k| {
-                    let c = base + Vec3::Y * (0.4 + 0.4 * k as f32);
-                    let along = (c - origin).dot(dir);
-                    (along > 0.0 && along < wall && (origin + dir * along).distance(c) < 0.3).then_some(along)
-                })
-                .reduce(f32::min)
-                .map(|d| (e, d))
-        })
-        .min_by(|a, b| a.1.total_cmp(&b.1));
-        if let Some((e, _)) = hit {
-        if let Ok((_, _, mut a, mut anim)) = actors.get_mut(e) {
-            a.alive = false;
-            let clip = lib.first_of(anim.set(), &["Die_Backward", "Die_Forward"]).unwrap_or_default();
-            anim.play_once(&clip);
-            commands.entity(e).remove::<Gait>();
-            let (kind, name) = (a.kind, a.name.clone());
-            on_kill(&mut mission, &text, kind, &name);
-        }
-    }
-    // Silenced, but not silent: anyone right there knows it for a shot; further off it is a
-    // noise worth checking.
-    let Ok(pt) = player.single() else { return };
-    let me = pt.translation();
-    let mut heard = false;
-    for (_, t, mut a, _) in &mut actors {
-        if a.alive && a.kind == Kind::Guard && t.translation().distance(me) < GUNSHOT_ALARM {
-            a.alerted = true;
-            a.last_seen = Some(me);
-            heard = true;
-        }
-    }
-    mission.noises.push((me, GUNSHOT_HEARING * 0.5));
-    if heard {
-        raise_alarm(Some(&mut commands), sound_bank.as_deref(), &mut mission, &text, None);
-    }
 }

@@ -27,6 +27,8 @@ use std::collections::HashMap;
 
 /// Cross-fade time between clips.
 const BLEND_SECONDS: f32 = 0.25;
+/// Fade time of the upper-body layer.
+const UPPER_FADE: f32 = 0.15;
 /// Below this speed a moving character plays its idle.
 const IDLE_BELOW: f32 = 0.15;
 /// Between walk and run clips by speed (m/s).
@@ -68,6 +70,13 @@ pub struct Rig {
     by_name: HashMap<String, usize>,
 }
 
+impl Rig {
+    /// The joint entity of bone `name` (`LEFT_FOOT`, `RIGHT_HAND`, …).
+    pub fn joint(&self, name: &str) -> Option<Entity> {
+        self.by_name.get(name).map(|&i| self.joints[i])
+    }
+}
+
 struct Playing {
     clip: String,
     time: f32,
@@ -83,12 +92,53 @@ pub struct Animator {
     previous: Option<(Playing, f32)>,
     /// Seconds left of a play-once clip; locomotion waits for it.
     busy: f32,
+    /// An upper-body clip (`UB_*`: aiming, reloading, holding an item) over the base pose.
+    /// It drives only the bones it has tracks for; the weight fades in and out.
+    upper: Option<Playing>,
+    upper_weight: f32,
+    upper_stopping: bool,
 }
 
 impl Animator {
     pub fn new(set: usize, clip: String) -> Self {
-        Self { set, current: Playing { clip, time: 0.0, rate: 1.0, looping: true }, previous: None, busy: 0.0 }
+        Self {
+            set,
+            current: Playing { clip, time: 0.0, rate: 1.0, looping: true },
+            previous: None,
+            busy: 0.0,
+            upper: None,
+            upper_weight: 0.0,
+            upper_stopping: false,
+        }
     }
+
+    /// Plays an upper-body clip over the base animation (looping, or once and then held).
+    pub fn play_upper(&mut self, clip: &str, looping: bool) {
+        self.upper_stopping = false;
+        if self.upper.as_ref().is_some_and(|u| u.clip == clip && u.looping == looping) {
+            return;
+        }
+        self.upper = Some(Playing { clip: clip.to_owned(), time: 0.0, rate: 1.0, looping });
+    }
+
+    /// Holds the upper-body clip still at `time` seconds (aim clips are a sweep of poses).
+    pub fn pose_upper(&mut self, time: f32) {
+        if let Some(u) = self.upper.as_mut() {
+            u.time = time;
+            u.rate = 0.0;
+        }
+    }
+
+    /// Fades the upper-body clip out.
+    pub fn stop_upper(&mut self) {
+        self.upper_stopping = true;
+    }
+
+    /// The upper-body clip playing, if any, and how far into it (seconds).
+    pub fn upper(&self) -> Option<(&str, f32)> {
+        self.upper.as_ref().filter(|_| !self.upper_stopping).map(|u| (u.clip.as_str(), u.time))
+    }
+
 
     pub fn set(&self) -> usize {
         self.set
@@ -315,6 +365,36 @@ fn animate(
         }
         if fade_done {
             anim.previous = None;
+        }
+
+        // Upper-body layer: overrides the bones its clip animates.
+        let target = if anim.upper.is_some() && !anim.upper_stopping { 1.0 } else { 0.0 };
+        anim.upper_weight += (target - anim.upper_weight).clamp(-dt / UPPER_FADE, dt / UPPER_FADE);
+        if anim.upper_weight <= 0.0 && anim.upper_stopping {
+            anim.upper = None;
+        }
+        let w = anim.upper_weight;
+        if let Some(upper) = anim.upper.as_mut() {
+            upper.time += dt * upper.rate;
+            match lib.clip(set, &upper.clip) {
+                Some(clip) => {
+                    let layer = sample_pose(rig, clip, upper.time, upper.looping);
+                    for (i, ((r, p), (lr, lp))) in pose.iter_mut().zip(layer).enumerate() {
+                        let bind = rig.bind_local[i];
+                        if let Some(lr) = lr {
+                            *r = Some(r.unwrap_or(bind.rotation).slerp(lr, w));
+                        }
+                        if let Some(lp) = lp {
+                            *p = Some(p.unwrap_or(bind.translation).lerp(lp, w));
+                        }
+                    }
+                }
+                None => {
+                    if missing.insert(upper.clip.clone()) {
+                        warn!("animation clip {:?} not found in set {set}", upper.clip);
+                    }
+                }
+            }
         }
 
         for (i, &j) in rig.joints.iter().enumerate() {

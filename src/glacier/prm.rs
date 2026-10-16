@@ -11,7 +11,8 @@
 //! - `+0x00 u16 flags` (0x181 for ordinary textured geometry), `+0x02 u16 kind`
 //! - `+0x04 u32 texture` — TEX id in the low 11 bits; bit 0x800 = alpha-blended, with
 //!   opacity taken from vertex alpha (fog cards, shadow decals, glass, water, icicles)
-//! - `+0x20 u32 render_state` — low byte looks like a blend/shading mode; not decoded yet
+//! - `+0x20 u32 render_state` — low byte looks like a blend/shading mode; bit 0x800000 marks
+//!   proxies that are never drawn (see `SubMesh::is_proxy`); the rest is not decoded yet
 //! - `+0x2C u32` — bits 16–23: LOD mask, bit i set = drawn at detail level i (0 = closest).
 //!   Models carry several overlapping versions; draw only one level.
 //! - `+0x08 u32 prev` — previous sub-mesh record of the same model, 0 terminates
@@ -52,6 +53,13 @@ impl SubMesh {
     /// Part of the most detailed version of the model (parts without a mask always are).
     pub fn in_lod0(&self) -> bool {
         self.lod_mask == 0 || self.lod_mask & 1 != 0
+    }
+
+    /// A simplified stand-in never drawn: untextured collision hulls, and parts whose render
+    /// state has bit 0x800000 (the same bit the untextured hulls carry) — e.g. the textured box
+    /// inside the AN-124's fuselage, reaching to the ground.
+    pub fn is_proxy(&self) -> bool {
+        self.texture == 0 || self.render_state & 0x80_0000 != 0
     }
 }
 

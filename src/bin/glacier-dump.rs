@@ -6,6 +6,14 @@ use anyhow::Result;
 use hitman_clone::glacier::level::Level;
 use std::{collections::BTreeMap, io::Write, path::Path};
 
+fn bevy_math_vec(p: [f32; 3]) -> [f32; 3] { p }
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] { [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+trait CrossY { fn cross_y(self, o: [f32; 3]) -> f32; }
+impl CrossY for [f32; 3] {
+    /// Y component of the cross product.
+    fn cross_y(self, o: [f32; 3]) -> f32 { self[2] * o[0] - self[0] * o[2] }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let id = args.first().filter(|a| !a.starts_with("--")).map_or("C02-1", String::as_str);
@@ -38,7 +46,139 @@ fn main() -> Result<()> {
     for (t, n) in by_type.iter().filter(|(_, n)| **n > 50) {
         println!("  type {t:#08x}: {n}");
     }
+    if let Some(oct) = &level.oct {
+        let all_polys: usize = oct.all_trees().map(|t| t.polys.len()).sum();
+        let all_nodes: usize = oct.all_trees().map(|t| t.nodes.len()).sum();
+        println!(
+            "  OCT physics: {} entity groups, {} global trees ({} nodes, {} polys), {} spatial links",
+            oct.entity_groups.len(),
+            oct.global_trees.len(),
+            all_nodes,
+            all_polys,
+            oct.spatial_links.len()
+        );
+    }
 
+    if let Some(i) = args.iter().position(|a| a == "--scripts") {
+        // `--scripts [OUT_DIR]`: disassemble every compiled script; summary to stdout.
+        use hitman_clone::glacier::ppo;
+        let out = args.get(i + 1).filter(|a| !a.starts_with("--")).map(Path::new);
+        if let Some(dir) = out {
+            std::fs::create_dir_all(dir)?;
+        }
+        let scripts: Vec<ppo::Script> = ppo::scripts(&level.zgf).into_iter().filter_map(|s| s.map_err(|e| println!("  bad script: {e:#}")).ok()).collect();
+        let program = ppo::Program::link(scripts);
+        if let Ok(spec) = std::env::var("PPO_NAME") {
+            // `PPO_NAME=k:i,i,…` prints global names as seen from script k (debugging).
+            let (k, list) = spec.split_once(':').unwrap_or(("0", ""));
+            let k: usize = k.parse().unwrap_or(0);
+            for i in list.split(',').filter_map(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+                println!("  name {i:#x} = {}", program.name(k, i));
+            }
+        }
+        for (k, script) in program.scripts.iter().enumerate() {
+            let (code, err) = ppo::disassemble(&program, k);
+            // Jumps must land on instruction starts.
+            let starts: std::collections::HashSet<usize> = code.iter().map(|i| i.at).collect();
+            let base = program.code_base[k];
+            let misaligned = code
+                .iter()
+                .flat_map(|i| i.targets.iter())
+                .filter(|&&t| t >= base && t < base + script.code.len() as u32 && !starts.contains(&((t - base) as usize)))
+                .count();
+            println!(
+                "  #{k:2} {:<22} <- {:<22} base {:#06x} {:>6} bytes, {:>5} instrs, {:>3} names from {:>3}, {} misaligned jumps{}",
+                ppo::short_name(&script.source),
+                program.parent[k].map_or("-", |p| ppo::short_name(&program.scripts[p].source)),
+                base,
+                script.code.len(),
+                code.len(),
+                script.names.len(),
+                script.name_base,
+                misaligned,
+                err.as_ref().map_or(String::new(), |e| format!("  STOPPED: {e}"))
+            );
+            if let Some(dir) = out {
+                let mut f = std::fs::File::create(dir.join(format!("{k:02}_{}.txt", ppo::short_name(&script.source))))?;
+                writeln!(f, "// {} (derives from {:?})\n// schema: {}\n", script.source, script.parent_source, script.schema)?;
+                let labels: std::collections::HashSet<u32> = code.iter().flat_map(|i| i.targets.iter().copied()).collect();
+                // State and handler entry points, by address.
+                let mut marks: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+                for st in &script.states {
+                    let name = program.name(k, st.name);
+                    marks.insert(st.entry, format!("\n// ======== state {name}"));
+                    for (h, &a) in st.handlers.iter().enumerate() {
+                        if a != u32::MAX {
+                            marks.entry(a).or_insert_with(|| format!("// ---- {name} handler {h}"));
+                        }
+                    }
+                }
+                writeln!(f, "// states: {}", script.states.iter().map(|st| program.name(k, st.name)).collect::<Vec<_>>().join(", "))?;
+                for (i, &a) in script.functions.iter().enumerate() {
+                    if a >= base && a < base + script.code.len() as u32 {
+                        marks.entry(a).or_insert_with(|| format!("// ---- function #{i}"));
+                    }
+                }
+                for ins in &code {
+                    if let Some(m) = marks.get(&(base + ins.at as u32)) {
+                        writeln!(f, "{m}")?;
+                    }
+                    if labels.contains(&(base + ins.at as u32)) {
+                        writeln!(f, "L{:04x}:", ins.at)?;
+                    }
+                    writeln!(f, "    {:<20} {}", ins.mnemonic, ins.args)?;
+                }
+                if let Some(e) = err {
+                    writeln!(f, "// STOPPED: {e}")?;
+                }
+            }
+        }
+    }
+    if let Some(i) = args.iter().position(|a| a == "--model") {
+        // `--model NAME`: per-submesh stats of the first entity with that name.
+        let name = args.get(i + 1).map(String::as_str).unwrap_or("");
+        if let Some(e) = level.entities.iter().find(|e| e.name == name) {
+            let model = level.prm.model(e.primitive)?;
+            println!("{} prim {:#x}: {} submeshes", e.name, e.primitive, model.submeshes.len());
+            // Layer pairs with identical vertex counts: compare heights vertex by vertex.
+            let lod0: Vec<_> = model.submeshes.iter().filter(|sm| sm.in_lod0()).collect();
+            for (i, a) in lod0.iter().enumerate() {
+                for b in &lod0[i + 1..] {
+                    if a.vertices.len() == b.vertices.len() && a.texture != b.texture {
+                        let d: Vec<f32> = a.vertices.iter().zip(&b.vertices).map(|(u, v)| u.pos[1] - v.pos[1]).collect();
+                        let same_xz = a.vertices.iter().zip(&b.vertices).filter(|(u, v)| (u.pos[0] - v.pos[0]).abs() < 0.5 && (u.pos[2] - v.pos[2]).abs() < 0.5).count();
+                        let below = d.iter().filter(|&&x| x < 0.0).count();
+                        println!(
+                            "  tex {} minus tex {}: {} verts share xz; dy min {:.2} max {:.2}; {} verts below",
+                            a.texture, b.texture, same_xz, d.iter().cloned().fold(f32::MAX, f32::min), d.iter().cloned().fold(f32::MIN, f32::max), below
+                        );
+                    }
+                }
+            }
+            for sm in &model.submeshes {
+                let alphas: Vec<u8> = sm.vertices.iter().map(|v| v.color[3]).collect();
+                let rgb: Vec<u8> = sm.vertices.iter().map(|v| v.color[0]).collect();
+                let ys: Vec<f32> = sm.vertices.iter().map(|v| v.pos[1]).collect();
+                let ny: Vec<f32> = sm.vertices.iter().map(|v| v.normal[1]).collect();
+                let down = ny.iter().filter(|&&n| n < 0.0).count();
+                println!("    normal y: {} down / {} up, min {:.2} max {:.2}", down, ny.len() - down, ny.iter().cloned().fold(1.0, f32::min), ny.iter().cloned().fold(-1.0, f32::max));
+                // Winding vs normal: how many triangles' geometric normal disagrees with vertex normals.
+                let flipped = sm.triangles.iter().filter(|t| {
+                    let p = t.map(|i| bevy_math_vec(sm.vertices[i as usize].pos));
+                    let n = sub(p[1], p[0]).cross_y(sub(p[2], p[0]));
+                    let vn: f32 = t.iter().map(|&i| sm.vertices[i as usize].normal[1]).sum();
+                    n * vn < 0.0
+                }).count();
+                println!("    triangles whose winding disagrees with their normals: {flipped} / {}", sm.triangles.len());
+                let hist = |v: &[u8]| { let mut h = [0usize; 5]; for &a in v { h[(a as usize * 5 / 256).min(4)] += 1; } h };
+                println!(
+                    "  tex {:4} rs {:#010x} lod {:#x} blended {}: {} verts {} tris, y {:.1}..{:.1}, alpha hist {:?}, red hist {:?}",
+                    sm.texture, sm.render_state, sm.lod_mask, sm.blended, sm.vertices.len(), sm.triangles.len(),
+                    ys.iter().cloned().fold(f32::MAX, f32::min), ys.iter().cloned().fold(f32::MIN, f32::max), hist(&alphas), hist(&rgb)
+                );
+            }
+        }
+    }
     if let Some(i) = args.iter().position(|a| a == "--paths") {
         for name in args.iter().skip(i + 1) {
             for (idx, e) in level.entities.iter().enumerate().filter(|(_, e)| &e.name == name) {
@@ -159,6 +299,27 @@ fn main() -> Result<()> {
         }
     }
 
+    if let Some(i) = args.iter().position(|a| a == "--anim-names") {
+        // `--anim-names [FILTER]`: every clip name per set (case-insensitive filter).
+        let filter = args.get(i + 1).map(|f| f.to_lowercase()).unwrap_or_default();
+        for set in &level.anm.sets {
+            let mut names: Vec<_> = set.animations.keys().filter(|n| n.to_lowercase().contains(&filter)).collect();
+            names.sort();
+            if !names.is_empty() {
+                println!("  {}: {}", set.path, names.iter().map(|n| format!("{n} ({:.1}s)", set.animations[*n].duration())).collect::<Vec<_>>().join(", "));
+            }
+        }
+    }
+    if let Some(i) = args.iter().position(|a| a == "--clip-bones") {
+        // `--clip-bones NAME`: bones a clip animates (first set that has it).
+        let name = args.get(i + 1).map(String::as_str).unwrap_or("");
+        if let Some(a) = level.anm.sets.iter().find_map(|s| s.animations.get(name)) {
+            println!("  {name}: {}", a.tracks.iter().map(|t| t.bone.as_str()).collect::<Vec<_>>().join(", "));
+            for t in a.tracks.iter().filter(|t| t.bone == "GROUND" || t.bone == "PELVIS") {
+                println!("    {} pos first {:?} last {:?}; rot first {:?} last {:?}", t.bone, t.positions.first(), t.positions.last(), t.rotations.first(), t.rotations.last());
+            }
+        }
+    }
     if args.iter().any(|a| a == "--anims") {
         for set in &level.anm.sets {
             let mut names: Vec<_> = set.animations.keys().collect();

@@ -8,6 +8,8 @@ pub mod audio;
 pub mod gms;
 pub mod level;
 pub mod loc;
+pub mod oct;
+pub mod ppo;
 pub mod prm;
 pub mod skin;
 pub mod tex;

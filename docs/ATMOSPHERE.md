@@ -36,3 +36,13 @@ Jesper Kyd's original loops from the level bank, crossfaded by `src/music.rs`:
 The calm and submarine loops pause while silent and resume in place; the others restart from
 the top each time. Other cues in the bank (`Music_Atmos_Loop`, `Music_Sus2`,
 `Music_Suspense1_Full`, `Music_Swat_Intense`) are spares for later states.
+
+## Grade
+
+The default is our own darker night (fog `NIGHT`, ambient 120, TonyMcMapface). `HITMAN_LOOK=faithful`
+matches colours measured from gameplay footage of the original (snow ≈ 56,90,91; fog ≈ 55,85,90
+sRGB): fog `srgb(0.20, 0.31, 0.33)`, ambient 700, lamps at 0.45× and no filmic tone curve
+(`Tonemapping::Linear`), like the 2004 fixed-function renderer.
+
+The level also contains the in-game map's floor plans (`C02-1__MAP_*`, drawn with
+`HMC_IngameMap_Colors_01a`) laid over the real ground; they are skipped when spawning.

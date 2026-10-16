@@ -99,7 +99,7 @@ fn play_emitters(
     mut commands: Commands,
     time: Res<Time>,
     bank: Option<Res<SoundBank>>,
-    camera: Query<&GlobalTransform, With<Camera3d>>,
+    camera: Query<&GlobalTransform, With<crate::player::OrbitCamera>>,
     mut emitters: Query<(Entity, &GlobalTransform, &mut Emitter)>,
 ) {
     let (Some(bank), Ok(cam)) = (bank, camera.single()) else { return };

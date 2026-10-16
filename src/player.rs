@@ -26,6 +26,10 @@ const EYE_HEIGHT: f32 = 1.65;
 const CROUCH_EYE_HEIGHT: f32 = 1.15;
 const CAMERA_DISTANCE: f32 = 3.2;
 const CAMERA_SHOULDER: f32 = 0.45;
+const AIM_SHOULDER: f32 = 0.35;
+const AIM_DISTANCE: f32 = 1.6;
+const FOV: f32 = std::f32::consts::FRAC_PI_4;
+const AIM_FOV: f32 = 0.55;
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 
 pub struct PlayerPlugin;
@@ -34,7 +38,8 @@ impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (toggle_mode, grab_cursor, (orbit_input, move_player, follow_camera).chain().run_if(playing)),
+            (toggle_mode, grab_cursor, (orbit_input, move_player, follow_camera).chain().run_if(playing))
+                .run_if(in_state(crate::flow::Phase::Playing)),
         );
     }
 }
@@ -48,8 +53,6 @@ pub struct Player {
     pub speed: f32,
     pub crouching: bool,
     pub crouch_toggle: bool,
-    pub step_timer: f32,
-    pub step_index: usize,
 }
 
 impl Player {
@@ -67,8 +70,10 @@ impl Player {
 /// Orbit state for the third-person camera.
 #[derive(Component)]
 pub struct OrbitCamera {
-    yaw: f32,
+    pub yaw: f32,
     pitch: f32,
+    /// 0 = normal, 1 = aiming over the shoulder (set by the weapons code).
+    pub aim: f32,
 }
 
 fn playing(cam: Query<(), (With<OrbitCamera>, Without<FreeCamera>)>) -> bool {
@@ -89,8 +94,6 @@ pub fn spawn(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut
                 speed: 0.0,
                 crouching: false,
                 crouch_toggle: false,
-                step_timer: 0.0,
-                step_index: 0,
             },
             Name::new("47"),
         ))
@@ -105,8 +108,6 @@ pub fn spawn(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut
             speed: 0.0,
             crouching: false,
             crouch_toggle: false,
-            step_timer: 0.0,
-            step_index: 0,
         });
         return m;
     }
@@ -128,7 +129,7 @@ impl OrbitCamera {
 
 pub fn orbit_camera() -> OrbitCamera {
     let yaw = std::env::var("HITMAN_YAW").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    OrbitCamera { yaw, pitch: -0.25 }
+    OrbitCamera { yaw, pitch: -0.25, aim: 0.0 }
 }
 
 fn toggle_mode(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>, cam: Query<(Entity, Has<FreeCamera>), With<OrbitCamera>>) {
@@ -173,11 +174,9 @@ fn orbit_input(motion: Res<AccumulatedMouseMotion>, cursor: Query<&CursorOptions
 }
 
 fn move_player(
-    mut commands: Commands,
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     world: Res<WorldCollision>,
-    sound_bank: Option<Res<crate::audio::SoundBank>>,
     cam: Query<&OrbitCamera>,
     mut player: Query<(&mut Transform, &mut Player)>,
     mut gaits: Query<&mut crate::character::Gait>,
@@ -206,8 +205,11 @@ fn move_player(
     let sneaking = (p.crouch_toggle || hold_sneak) && !is_dragging;
     p.crouching = sneaking;
 
+    let aiming = orbit.aim > 0.5;
     let speed = if is_dragging {
         DRAG_SPEED
+    } else if aiming {
+        WALK_SPEED * 0.6
     } else if sneaking {
         SNEAK_SPEED
     } else if keys.pressed(KeyCode::ShiftLeft) {
@@ -220,7 +222,8 @@ fn move_player(
     let mut pos = t.translation + wish * speed * dt;
     for _ in 0..4 {
         let mut max_push = Vec3::ZERO;
-        for h in [STEP_HEIGHT + RADIUS, 1.0, 1.5] {
+        // Knee, waist, chest and head: low overhangs (the plane's belly) block him too.
+        for h in [STEP_HEIGHT + RADIUS, 1.0, 1.5, 1.8] {
             let push = world.push_out_horizontal(pos + Vec3::Y * h, RADIUS);
             if push.length_squared() > max_push.length_squared() {
                 max_push = push;
@@ -236,8 +239,27 @@ fn move_player(
     p.vertical_speed -= GRAVITY * dt;
     let probe_from = pos + Vec3::Y * (STEP_HEIGHT + 0.05);
     let fall = (-p.vertical_speed * dt).max(0.0);
-    let reach = STEP_HEIGHT + 0.05 + if p.grounded { STEP_HEIGHT } else { fall };
-    match world.raycast(probe_from, Vec3::NEG_Y, reach) {
+    let reach = STEP_HEIGHT + 0.05 + if p.grounded { STEP_HEIGHT } else { fall.max(0.25) };
+
+    // Multi-point probe: check center, then 4 foot perimeter offsets to prevent slipping through triangle seams
+    let mut ground_hit = world.raycast(probe_from, Vec3::NEG_Y, reach);
+    if ground_hit.as_ref().is_none_or(|h| h.normal.y < MIN_FLOOR_NY) {
+        for offset in [
+            Vec3::new(0.08, 0.0, 0.0),
+            Vec3::new(-0.08, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.08),
+            Vec3::new(0.0, 0.0, -0.08),
+        ] {
+            if let Some(h) = world.raycast(probe_from + offset, Vec3::NEG_Y, reach) {
+                if h.normal.y >= MIN_FLOOR_NY {
+                    ground_hit = Some(h);
+                    break;
+                }
+            }
+        }
+    }
+
+    match ground_hit {
         Some(hit) if hit.normal.y >= MIN_FLOOR_NY && p.vertical_speed <= 0.0 => {
             pos.y = probe_from.y - hit.distance;
             p.vertical_speed = 0.0;
@@ -262,47 +284,36 @@ fn move_player(
     p.speed = moved;
     t.translation = pos;
 
-    if wish != Vec3::ZERO {
+    if aiming {
+        // Aiming: face where the camera looks and strafe.
+        let target = Transform::IDENTITY.looking_to(forward, Vec3::Y).rotation;
+        t.rotation = t.rotation.slerp(target, (TURN_RATE * 2.0 * dt).min(1.0));
+    } else if wish != Vec3::ZERO {
         let target = Transform::IDENTITY.looking_to(wish, Vec3::Y).rotation;
         t.rotation = t.rotation.slerp(target, (TURN_RATE * dt).min(1.0));
     }
 
-    // Footsteps audio
-    if p.grounded && p.speed > 0.15 && !sneaking && !is_dragging {
-        let interval = if keys.pressed(KeyCode::ShiftLeft) { 0.32 } else { 0.54 };
-        p.step_timer += dt;
-        if p.step_timer >= interval {
-            p.step_timer = 0.0;
-            p.step_index = (p.step_index + 1) % 3;
-            if let Some(sb) = &sound_bank {
-                let is_running = keys.pressed(KeyCode::ShiftLeft);
-                let vol = if is_running { 0.50 } else { 0.28 };
-                let is_metal = pos.x < -110.0 || (pos.x > 35.0 && pos.z > -20.0 && pos.z < 25.0);
-                let snd = if is_metal {
-                    &sb.step_steel[p.step_index % sb.step_steel.len()]
-                } else {
-                    &sb.step_snow[p.step_index % sb.step_snow.len()]
-                };
-                crate::audio::play_sound(&mut commands, snd, vol);
-            }
-        }
-    } else {
-        p.step_timer = 0.45;
-    }
 }
 
 fn follow_camera(
     world: Res<WorldCollision>,
     player: Query<(&Transform, &Player), Without<OrbitCamera>>,
-    mut cam: Query<(&mut Transform, &OrbitCamera)>,
+    mut cam: Query<(&mut Transform, &OrbitCamera, &mut Projection)>,
 ) {
-    let (Ok((pt, p)), Ok((mut ct, orbit))) = (player.single(), cam.single_mut()) else { return };
+    let (Ok((pt, p)), Ok((mut ct, orbit, mut projection))) = (player.single(), cam.single_mut()) else { return };
     let rot = Quat::from_euler(EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
     let eye_h = if p.crouching { CROUCH_EYE_HEIGHT } else { EYE_HEIGHT };
-    let pivot = pt.translation + Vec3::Y * eye_h + rot * Vec3::X * CAMERA_SHOULDER;
+    // Aiming pulls the camera in over the right shoulder and narrows the view.
+    let a = orbit.aim * orbit.aim * (3.0 - 2.0 * orbit.aim);
+    let shoulder = CAMERA_SHOULDER.lerp(AIM_SHOULDER, a);
+    let distance = CAMERA_DISTANCE.lerp(AIM_DISTANCE, a);
+    if let Projection::Perspective(persp) = &mut *projection {
+        persp.fov = FOV.lerp(AIM_FOV, a);
+    }
+    let pivot = pt.translation + Vec3::Y * eye_h + rot * Vec3::X * shoulder;
     let back = rot * Vec3::Z;
     // Spring arm: pull in when level geometry is between 47 and the camera.
-    let dist = world.raycast(pivot, back, CAMERA_DISTANCE).map_or(CAMERA_DISTANCE, |h| (h.distance - 0.2).max(0.3));
+    let dist = world.raycast(pivot, back, distance).map_or(distance, |h| (h.distance - 0.2).max(0.3));
     ct.translation = pivot + back * dist;
     ct.rotation = rot;
 }

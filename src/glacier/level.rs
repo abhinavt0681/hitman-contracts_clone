@@ -1,6 +1,6 @@
 //! Loads one scene's `_MAIN.ZIP` and exposes its parsed archives.
 
-use super::{anm::AnmFile, gms, loc::Strings, prm::PrmArchive, tex::TexArchive};
+use super::{anm::AnmFile, gms, loc::Strings, oct::OctFile, prm::PrmArchive, tex::TexArchive};
 use anyhow::{Context, Result};
 use std::{fs::File, io::Read, path::Path};
 
@@ -13,6 +13,9 @@ pub struct Level {
     pub strings: Strings,
     /// The `.SND` table: sound records that emitters and scripts refer to by offset.
     pub snd: Vec<u8>,
+    /// The `.ZGF`, inflated: the level's compiled scripts (see `ppo`).
+    pub zgf: Vec<u8>,
+    pub oct: Option<OctFile>,
 }
 
 impl Level {
@@ -32,7 +35,9 @@ impl Level {
         let anm = AnmFile::parse(&read("ANM")?).context("parsing ANM")?;
         let strings = Strings::parse(&read("LOC")?);
         let snd = read("SND").unwrap_or_default();
-        Ok(Self { id: id.to_owned(), entities, prm: PrmArchive::parse(read("PRM")?)?, tex: TexArchive::parse(read("TEX")?)?, anm, strings, snd })
+        let zgf = read("ZGF").ok().and_then(|z| gms::inflate(&z).ok()).unwrap_or_default();
+        let oct = read("OCT").ok().and_then(|bytes| OctFile::parse(&bytes).ok());
+        Ok(Self { id: id.to_owned(), entities, prm: PrmArchive::parse(read("PRM")?)?, tex: TexArchive::parse(read("TEX")?)?, anm, strings, snd, zgf, oct })
     }
 
     /// Name of the sound whose `.SND` record starts at `offset` (records hold a pointer to
