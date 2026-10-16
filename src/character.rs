@@ -66,6 +66,7 @@ impl AnimLibrary {
 #[derive(Component)]
 pub struct Rig {
     joints: Vec<Entity>,
+    parents: Vec<Option<usize>>,
     bind_local: Vec<Transform>,
     by_name: HashMap<String, usize>,
 }
@@ -75,6 +76,36 @@ impl Rig {
     pub fn joint(&self, name: &str) -> Option<Entity> {
         self.by_name.get(name).map(|&i| self.joints[i])
     }
+
+    /// Index of bone `name`.
+    pub fn index(&self, name: &str) -> Option<usize> {
+        self.by_name.get(name).copied()
+    }
+
+    /// Joint entities, parents before children.
+    pub fn joints(&self) -> &[Entity] {
+        &self.joints
+    }
+
+    pub fn parent(&self, i: usize) -> Option<usize> {
+        self.parents[i]
+    }
+
+    /// Bind pose of bone `i` relative to its parent.
+    pub fn bind_local(&self, i: usize) -> Transform {
+        self.bind_local[i]
+    }
+
+    /// Bind pose of bone `i` in the model's space.
+    pub fn bind_model(&self, i: usize) -> Mat4 {
+        let mut m = self.bind_local[i].to_matrix();
+        let mut at = self.parents[i];
+        while let Some(p) = at {
+            m = self.bind_local[p].to_matrix() * m;
+            at = self.parents[p];
+        }
+        m
+    }
 }
 
 struct Playing {
@@ -82,6 +113,8 @@ struct Playing {
     time: f32,
     rate: f32,
     looping: bool,
+    /// Only frames `a..b` of the clip (a ladder's climbing stroke, its climb-over).
+    range: Option<(f32, f32)>,
 }
 
 /// Which clip a character plays, with a short cross-fade from the previous one.
@@ -97,18 +130,21 @@ pub struct Animator {
     upper: Option<Playing>,
     upper_weight: f32,
     upper_stopping: bool,
+    /// The body is a ragdoll now: physics poses the bones, not clips.
+    limp: bool,
 }
 
 impl Animator {
     pub fn new(set: usize, clip: String) -> Self {
         Self {
             set,
-            current: Playing { clip, time: 0.0, rate: 1.0, looping: true },
+            current: Playing { clip, time: 0.0, rate: 1.0, looping: true, range: None },
             previous: None,
             busy: 0.0,
             upper: None,
             upper_weight: 0.0,
             upper_stopping: false,
+            limp: false,
         }
     }
 
@@ -118,7 +154,7 @@ impl Animator {
         if self.upper.as_ref().is_some_and(|u| u.clip == clip && u.looping == looping) {
             return;
         }
-        self.upper = Some(Playing { clip: clip.to_owned(), time: 0.0, rate: 1.0, looping });
+        self.upper = Some(Playing { clip: clip.to_owned(), time: 0.0, rate: 1.0, looping, range: None });
     }
 
     /// Holds the upper-body clip still at `time` seconds (aim clips are a sweep of poses).
@@ -144,6 +180,32 @@ impl Animator {
         self.set
     }
 
+    /// Plays frames `a..b` of `clip`: looping, or once (backwards from `b` when `rate` < 0).
+    /// Restarts only if the clip, range or looping changes.
+    pub fn play_range(&mut self, clip: &str, rate: f32, a: f32, b: f32, looping: bool) {
+        let range = Some((a, b));
+        if self.current.clip == clip && self.current.range == range && self.current.looping == looping {
+            self.current.rate = rate;
+            return;
+        }
+        // A one-shot played backwards (or held, `rate` -0.0) starts on its last frame.
+        let time = if !looping && rate.is_sign_negative() { -1e-6 } else { 0.0 };
+        let old = std::mem::replace(&mut self.current, Playing { clip: clip.to_owned(), time, rate, looping, range });
+        self.previous = Some((old, BLEND_SECONDS));
+        self.busy = 0.0;
+    }
+
+    /// Hands the skeleton over to physics for good (see `ragdoll`).
+    pub fn go_limp(&mut self) {
+        self.limp = true;
+    }
+
+
+    /// A play-once clip (a death, a kill) is still running.
+    pub fn busy(&self) -> bool {
+        self.busy > 0.0
+    }
+
     /// Loops `clip`, cross-fading from whatever was playing.
     pub fn play(&mut self, clip: &str, rate: f32) {
         self.start(clip, rate, true);
@@ -167,7 +229,7 @@ impl Animator {
             self.current.rate = rate;
             return;
         }
-        let old = std::mem::replace(&mut self.current, Playing { clip: clip.to_owned(), time: 0.0, rate, looping });
+        let old = std::mem::replace(&mut self.current, Playing { clip: clip.to_owned(), time: 0.0, rate, looping, range: None });
         self.previous = Some((old, BLEND_SECONDS));
     }
 }
@@ -185,6 +247,8 @@ pub struct Gait {
     pub run: Option<(String, f32)>,
     pub crouch_walk: Option<(String, f32)>,
     pub drag_walk: Option<(String, f32)>,
+    /// Locomotion leaves the animator alone while set (climbing a ladder drives it).
+    pub hold: bool,
 }
 
 impl Gait {
@@ -202,6 +266,7 @@ impl Gait {
             run: with_speed(&["Run"]),
             crouch_walk: with_speed(&["Sneak_Forward", "Crouch_Forward"]),
             drag_walk: with_speed(&["Drag_Backward", "Drag_Forward"]),
+            hold: false,
         }
     }
 }
@@ -267,12 +332,16 @@ pub fn attach(commands: &mut Commands, root: Entity, model: &SkinnedModel, asset
     }
 
     let by_name = model.bones.iter().enumerate().map(|(i, b)| (b.name.clone(), i)).collect();
-    commands.entity(root).insert(Rig { joints, bind_local, by_name });
+    let parents = model.bones.iter().map(|b| b.parent).collect();
+    commands.entity(root).insert(Rig { joints, parents, bind_local, by_name });
 }
 
 fn choose_locomotion(mut q: Query<(&Gait, &mut Animator)>) {
     for (gait, mut anim) in &mut q {
-        if anim.busy > 0.0 {
+        if anim.busy > 0.0 || anim.limp {
+            continue;
+        }
+        if gait.hold {
             continue;
         }
         let pick = if gait.speed < IDLE_BELOW {
@@ -301,10 +370,18 @@ fn choose_locomotion(mut q: Query<(&Gait, &mut Animator)>) {
 }
 
 /// Local pose for one clip at `time`: per joint, an optional rotation and translation.
-fn sample_pose(rig: &Rig, clip: &Animation, time: f32, looping: bool) -> Vec<(Option<Quat>, Option<Vec3>)> {
+fn sample_pose(rig: &Rig, clip: &Animation, time: f32, looping: bool, range: Option<(f32, f32)>) -> Vec<(Option<Quat>, Option<Vec3>)> {
     let mut pose = vec![(None, None); rig.joints.len()];
     let frames = clip.frames.max(1) as f32;
-    let frame = if looping { (time * anm::FPS) % frames } else { (time * anm::FPS).min(frames) };
+    // `rem_euclid`: a clip played backwards (climbing down a ladder) wraps the right way.
+    let t = time * anm::FPS;
+    let frame = match (range, looping) {
+        (Some((a, b)), true) => a + t.rem_euclid(b - a),
+        (Some((a, b)), false) if t < 0.0 => b + t.max(a - b),
+        (Some((a, b)), false) => a + t.min(b - a),
+        (None, true) => t.rem_euclid(frames),
+        (None, false) => t.min(frames),
+    };
     for track in &clip.tracks {
         // Looping clips (locomotion, idles) play in place: gameplay moves the character. One-off
         // clips keep their root motion; a death needs it to bring the body to the floor.
@@ -333,6 +410,9 @@ fn animate(
     }
     let dt = time.delta_secs();
     for (rig, mut anim) in &mut rigs {
+        if anim.limp {
+            continue;
+        }
         let set = anim.set;
         anim.current.time += dt * anim.current.rate;
         let Some(clip) = lib.clip(set, &anim.current.clip) else {
@@ -343,8 +423,12 @@ fn animate(
             anim.busy = 0.0;
             continue;
         };
-        anim.busy = if anim.current.looping { 0.0 } else { (clip.duration() - anim.current.time).max(0.0) / anim.current.rate.max(0.01) };
-        let mut pose = sample_pose(rig, clip, anim.current.time, anim.current.looping);
+        anim.busy = match (anim.current.looping, anim.current.range) {
+            (true, _) => 0.0,
+            (false, Some((a, b))) => ((b - a) / anm::FPS - anim.current.time.abs()).max(0.0) / anim.current.rate.abs().max(0.01),
+            (false, None) => (clip.duration() - anim.current.time).max(0.0) / anim.current.rate.max(0.01),
+        };
+        let mut pose = sample_pose(rig, clip, anim.current.time, anim.current.looping, anim.current.range);
 
         let mut fade_done = false;
         if let Some((prev, remaining)) = anim.previous.as_mut() {
@@ -352,7 +436,7 @@ fn animate(
             *remaining -= dt;
             let w = (*remaining / BLEND_SECONDS).clamp(0.0, 1.0);
             if let Some(prev_clip) = lib.clip(set, &prev.clip) {
-                let old = sample_pose(rig, prev_clip, prev.time, prev.looping);
+                let old = sample_pose(rig, prev_clip, prev.time, prev.looping, prev.range);
                 for (i, ((r, p), (or, op))) in pose.iter_mut().zip(old).enumerate() {
                     let bind = rig.bind_local[i];
                     let (a, b) = (or.unwrap_or(bind.rotation), r.unwrap_or(bind.rotation));
@@ -378,7 +462,7 @@ fn animate(
             upper.time += dt * upper.rate;
             match lib.clip(set, &upper.clip) {
                 Some(clip) => {
-                    let layer = sample_pose(rig, clip, upper.time, upper.looping);
+                    let layer = sample_pose(rig, clip, upper.time, upper.looping, upper.range);
                     for (i, ((r, p), (lr, lp))) in pose.iter_mut().zip(layer).enumerate() {
                         let bind = rig.bind_local[i];
                         if let Some(lr) = lr {

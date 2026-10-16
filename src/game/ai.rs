@@ -318,7 +318,7 @@ pub(super) fn guard_combat(
     nav: Option<Res<NavGrid>>,
     mission: Res<Mission>,
     player: Query<&GlobalTransform, With<Player>>,
-    mut actors: Query<(&mut Transform, &GlobalTransform, &mut Actor, Option<&mut Gait>, &mut Steering)>,
+    mut actors: Query<(&mut Transform, &GlobalTransform, &mut Actor, Option<&mut Gait>, &mut Steering), Without<crate::cutscene::InScene>>,
 ) {
     if mission.outcome.is_some() {
         return;
@@ -388,7 +388,7 @@ pub(super) fn actor_patrol(
     mission: Option<Res<Mission>>,
     player: Query<&GlobalTransform, With<Player>>,
     mut seed: Local<u32>,
-    mut actors: Query<(&mut Transform, &mut Actor, Option<&mut Gait>, &mut Patrol, &mut Steering)>,
+    mut actors: Query<(&mut Transform, &mut Actor, Option<&mut Gait>, &mut Patrol, &mut Steering), Without<crate::cutscene::InScene>>,
 ) {
     if mission.is_some_and(|m| m.outcome.is_some()) {
         return;

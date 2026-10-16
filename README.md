@@ -26,6 +26,14 @@ readers reverse-engineered for this project.
     range, damage and rate of fire.
   - The fiber wire, using the original strangle animations.
   - Poison and the bomb remote.
+- **Ladders:** all nine of the level's ladders (the tunnel shaft, the ice under the submarine,
+  the mountain path…), climbed with the original's climbing animation.
+- **Dialogue scenes:** letterboxed, in the original voices and subtitles: the gate guard waving
+  "Mr. Fuchs" through, the frisk on deck (a gun on you is found; the wire isn't), Bjarkhov's
+  greeting. Mission notices in the original's top bar; picked-up items named and described.
+- **Disguises:** taking an outfit leaves 47's suit folded where he changed; he can put it back on.
+- **Ragdolls:** the dead go limp and fall where they're shot (with Rapier physics), settle on
+  stairs and walkways, and drag by a wrist or ankle.
 - **Guards:**
   - They react to light, noise, disguises, bodies and drawn guns, then investigate, search
     and hunt you.
@@ -87,16 +95,17 @@ nobody has tested them yet.
 | Mouse | look (click to capture the cursor) |
 | WASD, Shift | move, run |
 | Ctrl / C | sneak |
-| E | interact: strangle from behind, take an outfit, pick up or place things, leave on the plane |
+| E | interact: strangle from behind, take an outfit, climb ladders, pick up or place things, put your suit back on, leave on the plane |
 | F | take a dead soldier's AK-47 |
 | G | drag / drop a body |
 | 1–6, mouse wheel | holster, fiber wire, Silverballer, poison, bomb remote, AK-47 |
 | Left click | use the item / fire |
 | Right mouse | aim over the shoulder |
 | R | reload |
+| X | put the gun in hand down (to pass a frisk); E picks it up again |
 | M / Tab | map and objectives |
 | Esc | pause menu (objectives, briefing, restart, quit) |
-| F1 | free-fly debug camera |
+| F1 | free-fly debug camera (only when launched with `HITMAN_FREECAM=1`) |
 
 It's meant to be punishing: guards who see you holding a gun, or find a body, will hunt you,
 and a burst of AK fire kills in seconds.
@@ -200,7 +209,8 @@ its assets. Keep it that way, so the project can stay up.
 
 The bundled font, Michroma, is under the SIL Open Font License (`src/fonts/OFL.txt`).
 
-Licence for the code: _to be decided by the maintainer._
+The code is under the [MIT License](LICENSE). It covers only this project's own code and
+documentation, never the game or anything taken from it.
 
 ## Credits
 

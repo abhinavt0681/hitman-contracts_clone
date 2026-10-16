@@ -2,11 +2,13 @@
 name = "hitman_clone"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 default-run = "hitman_clone"
 
 [dependencies]
 anyhow = "1.0.104"
 bevy = { version = "0.20", features = ["free_camera", "wav"] }
+bevy_rapier3d = "0.37"
 flate2 = "1.1.10"
 texpresso = "2.0.2"
 zip = { version = "9.0.3", default-features = false, features = ["deflate"] }

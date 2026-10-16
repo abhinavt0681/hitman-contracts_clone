@@ -48,6 +48,28 @@ pub struct LevelBounds {
     pub median: Vec3,
     /// World position (m) of every GMS entity, composed through the scene tree.
     pub entity_world: Vec<Vec3>,
+    /// World-space boxes of the level's ladder guides (see `ladder`).
+    pub ladder_guides: Vec<LadderGuide>,
+}
+
+/// Engine class of a ladder guide: an invisible box spanning a climbable ladder
+/// (`LadderSub_T1Guide`, `MountainLadder_T1Guide_01`, …).
+const LADDER_GUIDE_CLASS: u32 = 0x4000022;
+
+pub struct LadderGuide {
+    pub name: String,
+    pub min: Vec3,
+    pub max: Vec3,
+    /// From the ladder mesh at the guide, if any: the centre line of its rungs (low and high
+    /// points of its middle) and the horizontal direction the rungs run along. Ladders needn't
+    /// be axis-aligned: the submarine's is turned about 30°.
+    pub rail: Option<LadderRail>,
+}
+
+pub struct LadderRail {
+    pub low: Vec3,
+    pub high: Vec3,
+    pub across: Vec3,
 }
 
 
@@ -154,6 +176,57 @@ pub fn spawn_level(
     }
 
     let lifts = layer_flats(level, &world_positions, &world_rotations);
+    let ladder_guides: Vec<LadderGuide> = level
+        .entities
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.type_id == LADDER_GUIDE_CLASS && e.primitive != 0)
+        .filter_map(|(i, e)| {
+            let model = level.prm.model(e.primitive).ok()?;
+            let world = instance_transform(world_rotations[i], world_positions[i]).to_matrix();
+            // Guides carry no geometry, only their model's bounding box.
+            let (a, b) = (model.bbox_min, model.bbox_max);
+            let (min, max) = (0..8)
+                .map(|k| [if k & 1 == 0 { a[0] } else { b[0] }, if k & 2 == 0 { a[1] } else { b[1] }, if k & 4 == 0 { a[2] } else { b[2] }])
+                .map(|c| world.transform_point3(Vec3::from(swap_xz(c))))
+                .fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
+            (min.x <= max.x).then(|| LadderGuide { name: e.name.clone(), min, max, rail: None })
+        })
+        .collect();
+    // Each ladder mesh near a guide gives that guide its rail: the mean of its bottom and top
+    // tenth of vertices.
+    let mut ladder_guides = ladder_guides;
+    for (i, e) in level.entities.iter().enumerate().filter(|(_, e)| e.name.contains("Ladder") && e.type_id == STATIC_GEOM_TYPE && e.primitive != 0) {
+        let Ok(model) = level.prm.model(e.primitive) else { continue };
+        let world = instance_transform(world_rotations[i], world_positions[i]).to_matrix();
+        let points: Vec<Vec3> = model.submeshes.iter().filter(|s| s.in_lod0() && !s.is_proxy()).flat_map(|s| s.vertices.iter()).map(|v| world.transform_point3(Vec3::from(swap_xz(v.pos)))).collect();
+        let (lo, hi) = points.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
+        if points.is_empty() || hi - lo < 1.0 {
+            continue;
+        }
+        let band = |from: f32, to: f32| -> Vec<Vec3> { points.iter().copied().filter(|p| p.y >= lo + from * (hi - lo) && p.y <= lo + to * (hi - lo)).collect() };
+        let mean = |ps: &[Vec3]| ps.iter().copied().sum::<Vec3>() / ps.len().max(1) as f32;
+        // The middle of the ladder: clear of hooks at the top and feet at the bottom.
+        let (low_band, high_band, mid) = (band(0.2, 0.4), band(0.6, 0.8), band(0.2, 0.8));
+        if low_band.is_empty() || high_band.is_empty() {
+            continue;
+        }
+        let (low, high) = (mean(&low_band), mean(&high_band));
+        // The rungs' direction: the main horizontal axis of the middle's vertices.
+        let c = mean(&mid);
+        let (mut xx, mut xz, mut zz) = (0.0, 0.0, 0.0);
+        for p in &mid {
+            let (dx, dz) = (p.x - c.x, p.z - c.z);
+            xx += dx * dx;
+            xz += dx * dz;
+            zz += dz * dz;
+        }
+        let angle = 0.5 * (2.0 * xz).atan2(xx - zz);
+        let across = Vec3::new(angle.cos(), 0.0, angle.sin());
+        if let Some(g) = ladder_guides.iter_mut().filter(|g| g.rail.is_none()).find(|g| ((g.min + g.max) * 0.5).with_y(0.0).distance(c.with_y(0.0)) < 1.0 && g.max.y > lo && g.min.y < hi) {
+            g.rail = Some(LadderRail { low, high, across });
+    }
+    }
     let mut ddoor_leaves: HashMap<usize, Vec<(bevy::prelude::Entity, u32)>> = HashMap::new();
 
     for (index, e) in level.entities.iter().enumerate() {
@@ -289,7 +362,8 @@ pub fn spawn_level(
                     .flat_map(|m| m.submeshes.iter().filter(|sm| sm.in_lod0()))
                     .map(|sm| format!("tex {} rs {:#x}{}", sm.texture, sm.render_state, if sm.blended { " blended" } else { "" }))
                     .collect();
-                info!("near: {} at {:.1?} lift {:.3} parts {:?}", e.name, transform.translation.to_array(), lifts.get(&index).copied().unwrap_or(0.0), parts);
+                let bounds = model.iter().flat_map(|m| m.submeshes.iter().flat_map(|sm| sm.vertices.iter())).map(|v| transform.transform_point(Vec3::from(swap_xz(v.pos)))).fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
+                info!("near: {} at {:.1?} lift {:.3} bounds {:.2?}..{:.2?} parts {:?}", e.name, transform.translation.to_array(), lifts.get(&index).copied().unwrap_or(0.0), bounds.0, bounds.1, parts);
             }
         }
         if let Some(props) = &e.cloth {
@@ -454,7 +528,7 @@ pub fn spawn_level(
     };
     let median = Vec3::new(axis(0), axis(1), axis(2));
     let entity_world: Vec<Vec3> = world_positions.iter().map(|p| glacier_to_bevy(*p)).collect();
-    LevelBounds { min, max, median, entity_world }
+    LevelBounds { min, max, median, entity_world, ladder_guides }
 }
 
 /// Finds visible floors with no collision under them (where 47 would fall through), on a
@@ -700,7 +774,7 @@ fn is_underlay(sm: &prm::SubMesh) -> bool {
     size.y < 1.0 && size.x * size.z > 20.0 * 100.0 * 100.0
 }
 
-fn build_mesh(sm: &prm::SubMesh) -> Mesh {
+pub(crate) fn build_mesh(sm: &prm::SubMesh) -> Mesh {
     let sink = if is_underlay(sm) { UNDERLAY_SINK } else { 0.0 };
     let pos: Vec<[f32; 3]> = sm.vertices.iter().map(|v| swap_xz([v.pos[0], v.pos[1] - sink, v.pos[2]])).collect();
     let nrm: Vec<[f32; 3]> = sm.vertices.iter().map(|v| swap_xz(v.normal)).collect();

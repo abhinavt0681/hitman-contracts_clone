@@ -310,6 +310,18 @@ fn main() -> Result<()> {
             }
         }
     }
+    if let Some(i) = args.iter().position(|a| a == "--skeleton") {
+        // `--skeleton ACTOR`: the bone hierarchy of that actor's model (the `Ground` entity
+        // that follows it), with bind-pose offsets from the parent.
+        let name = args.get(i + 1).map(String::as_str).unwrap_or("");
+        if let Some(k) = level.entities.iter().position(|e| e.name == name) {
+            let model = level.prm.skinned_model(level.entities[k + 1].primitive)?;
+            for (j, b) in model.bones.iter().enumerate() {
+                let parent = b.parent.map_or("-".to_owned(), |p| model.bones[p].name.clone());
+                println!("  {j:2} {:<16} <- {:<16} t {:?}", b.name, parent, b.translation);
+            }
+        }
+    }
     if let Some(i) = args.iter().position(|a| a == "--clip-bones") {
         // `--clip-bones NAME`: bones a clip animates (first set that has it).
         let name = args.get(i + 1).map(String::as_str).unwrap_or("");
@@ -444,6 +456,11 @@ fn main() -> Result<()> {
         for (k, v) in level.strings.iter() {
             if filter.is_empty() || k.to_lowercase().contains(&filter.to_lowercase()) || v.to_lowercase().contains(&filter.to_lowercase()) {
                 println!("  {k} = {v}");
+            }
+        }
+        for (k, v) in level.strings.descriptions() {
+            if filter.is_empty() || k.to_lowercase().contains(&filter.to_lowercase()) || v.to_lowercase().contains(&filter.to_lowercase()) {
+                println!("  {k} (description) = {v}");
             }
         }
     }

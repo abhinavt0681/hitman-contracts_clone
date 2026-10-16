@@ -13,6 +13,7 @@ use hitman_clone::glacier::{loc::Strings, skin::SkinnedModel, tex::TexArchive};
 use std::collections::HashMap;
 
 mod actions;
+pub mod bundle;
 mod ai;
 mod doors;
 mod mission;
@@ -43,6 +44,7 @@ impl Plugin for GamePlugin {
                 shoot,
             )
                 .chain()
+                .in_set(GameplaySet)
                 .run_if(resource_exists::<Mission>)
                 .run_if(in_state(crate::flow::Phase::Playing)),
         );
@@ -59,12 +61,26 @@ impl Plugin for GamePlugin {
                 log_minds,
                 weapons::fade_flashes,
                 weapons::hold_models,
+                weapons::drop_and_pick_up.after(GameplaySet),
+                bundle::suit_bundle.after(GameplaySet),
             )
                 .run_if(resource_exists::<Mission>)
                 .run_if(in_state(crate::flow::Phase::Playing)),
         );
     }
 }
+/// How a message is shown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Notice {
+    Info,
+    Warning,
+    Speech,
+}
+
+/// 47's actions and weapons (they claim the prompt and the E key first).
+#[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GameplaySet;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
     Guard,
@@ -83,6 +99,17 @@ pub enum Outfit {
     Bjarkhov,
 }
 impl Outfit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Outfit::Suit => "Suit",
+            Outfit::Soldier => "Russian soldier",
+            Outfit::Bodyguard => "Fuchs's bodyguard",
+            Outfit::BombWorker => "Bomb worker (radiation suit)",
+            Outfit::Civilian => "Civilian",
+            Outfit::Fuchs => "Fabian Fuchs",
+            Outfit::Bjarkhov => "Commander Bjarkhov",
+        }
+    }
     pub fn from_actor(name: &str) -> Self {
         match name {
             n if n.contains("Bjarkhov") => Outfit::Bjarkhov,
@@ -106,17 +133,6 @@ impl Outfit {
         }
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Outfit::Suit => "Suit",
-            Outfit::Soldier => "Russian soldier",
-            Outfit::Bodyguard => "Fuchs's bodyguard",
-            Outfit::BombWorker => "Bomb worker (radiation suit)",
-            Outfit::Civilian => "Civilian",
-            Outfit::Fuchs => "Fabian Fuchs",
-            Outfit::Bjarkhov => "Commander Bjarkhov",
-        }
-    }
 }
 #[derive(Component)]
 pub struct Actor {
@@ -239,16 +255,6 @@ pub enum Item {
     AssaultRifle,
 }
 impl Item {
-    pub fn label(self) -> &'static str {
-        match self {
-            Item::Holstered => "Holstered",
-            Item::FiberWire => "Fiber Wire",
-            Item::SilencedPistol => "Silenced Silverballer",
-            Item::PoisonVial => "Cyanide Poison",
-            Item::BombRemote => "Bomb Remote Detonator",
-            Item::AssaultRifle => "AK-47",
-        }
-    }
 }
 /// World positions (m) of mission locations, from GMS entities.
 #[derive(Resource)]
@@ -263,6 +269,8 @@ pub struct Anchors {
     pub bjarkhov_office: Vec3,
     pub bjarkhov_desk: Vec3,
     pub ship_gangway: Vec3,
+    /// Where Fuchs is frisked on the ship (`FriskHitman_triggerbox`, `…#01`).
+    pub frisk: Vec<Vec3>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -293,7 +301,10 @@ pub struct Mission {
     pub soup_timer: Option<f32>,
     pub alarm: bool,
     pub collateral: u32,
-    pub messages: Vec<(String, f32)>,
+    /// The item just picked up: name, description, seconds left on screen.
+    pub picked_up: Option<(String, String, f32)>,
+    /// On-screen notices and subtitles, with seconds left to show.
+    pub messages: Vec<(String, f32, Notice)>,
     pub prompt: Option<String>,
     pub outcome: Option<Outcome>,
     /// Seconds 47 is busy with an action and can't move.
@@ -302,6 +313,11 @@ pub struct Mission {
     pub dragging_body: Option<Entity>,
     pub drag_timer: f32,
     pub bjarkhov_meeting_state: u8,
+    /// The frisk on deck: 0 not yet, 1 in progress, 2 done.
+    pub frisk_state: u8,
+    pub frisker: Option<Entity>,
+    /// 47 still has his Silverballer (he can drop it, X, and pick it up again).
+    pub carrying_pistol: bool,
     pub bjarkhov_vodka_poisoned: bool,
 }
 impl Mission {
@@ -325,6 +341,7 @@ impl Mission {
             alarm: false,
             collateral: 0,
             messages: Vec::new(),
+            picked_up: None,
             prompt: None,
             outcome: None,
             busy: 0.0,
@@ -332,14 +349,40 @@ impl Mission {
             dragging_body: None,
             drag_timer: 0.0,
             bjarkhov_meeting_state: 0,
+            frisk_state: 0,
+            frisker: None,
+            carrying_pistol: true,
             bjarkhov_vodka_poisoned: false,
         }
     }
 
+    /// Shows the item just picked up, named and described as in the level's strings.
+    pub fn picked_up(&mut self, text: &Text, item: &str, fallback: &str) {
+        let name = text.0.get(item).unwrap_or(fallback).to_owned();
+        let description = text.0.description(item).unwrap_or("").to_owned();
+        self.picked_up = Some((name, description, 4.0));
+    }
+
+    /// An information notice (the original's blue "INFORMATION" bar).
     pub fn say(&mut self, msg: impl Into<String>) {
-        let msg = msg.into();
-        if !self.messages.iter().any(|(m, _)| *m == msg) {
-            self.messages.push((msg, 4.0));
+        self.notice(msg.into(), Notice::Info, 4.0);
+    }
+
+    /// A warning notice (red "WARNING": alarms, radiation, danger).
+    pub fn warn(&mut self, msg: impl Into<String>) {
+        self.notice(msg.into(), Notice::Warning, 4.5);
+    }
+
+    /// A spoken line, shown as a subtitle for as long as it takes to read.
+    pub fn speak(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        let secs = 2.0 + 0.065 * line.chars().count() as f32;
+        self.notice(line, Notice::Speech, secs);
+    }
+
+    fn notice(&mut self, msg: String, kind: Notice, secs: f32) {
+        if !self.messages.iter().any(|(m, _, _)| *m == msg) {
+            self.messages.push((msg, secs, kind));
         }
     }
 
@@ -375,14 +418,14 @@ fn raise_alarm(
 ) {
     if !mission.alarm {
         mission.alarm = true;
-        mission.say(text.0.get("NearByGuardsAlarmed").unwrap_or("Nearby guards alarmed"));
+        mission.warn(text.0.get("NearByGuardsAlarmed").unwrap_or("Nearby guards alarmed"));
         if let (Some(cmds), Some(sb)) = (commands, sound_bank) {
             crate::audio::play_sound(cmds, &sb.base_alarm, 0.65);
             crate::audio::play_sound(cmds, &sb.osd_warning, 0.7);
         }
     }
     if let Some(w) = why {
-        mission.say(w.to_owned());
+        mission.warn(w.to_owned());
     }
 }
 fn on_kill(mission: &mut Mission, text: &Text, kind: Kind, name: &str) {
@@ -409,6 +452,12 @@ fn messages_tick(time: Res<Time>, mut mission: ResMut<Mission>) {
         m.1 -= dt;
     }
     mission.messages.retain(|m| m.1 > 0.0);
+    if let Some((_, _, t)) = mission.picked_up.as_mut() {
+        *t -= dt;
+        if *t <= 0.0 {
+            mission.picked_up = None;
+        }
+    }
 }
 /// Enter after the mission ends restarts the game process (simplest full reset).
 fn restart(keys: Res<ButtonInput<KeyCode>>, mission: Res<Mission>, mut exit: MessageWriter<AppExit>) {
@@ -461,8 +510,12 @@ fn debug_setup(
             "BombWorker" => Outfit::BombWorker,
             "Bodyguard" => Outfit::Bodyguard,
             "Civilian" => Outfit::Civilian,
+            "Fuchs" => Outfit::Fuchs,
             _ => Outfit::Suit,
         };
+    }
+    if std::env::var_os("HITMAN_UNARMED").is_some() {
+        mission.carrying_pistol = false;
     }
     if std::env::var_os("HITMAN_ALL_OBJECTIVES").is_some() {
         mission.objectives[0].done = true;

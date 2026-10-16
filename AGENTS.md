@@ -40,6 +40,10 @@ cost time.
 | `cloth` | Verlet cloth for the flag and canvas (GMS class `0x2000F6`) |
 | `audio`, `music`, `ambience`, `footsteps` | `SoundBank` (sounds by name from the level's `.WHD`/`.WAV` and `streams.wav`); the adaptive score; the level's 3D sound emitters; animation-timed footsteps by surface |
 | `hud`, `map` | The HUD (with a weapon icon rendered live on render layer 2); the map screen (orthographic camera on render layer 1, showing the original's map meshes) |
+| `ragdoll` | Rapier physics (`bevy_rapier3d`): the dead go limp (13 jointed capsules, knee and elbow hinges measured from the original clips); the level is one fixed trimesh; dragging pulls a wrist or ankle |
+| `ladder` | Ladders from the level's `*Guide` entities (box sits 1.1 m above the floors it joins), facing from the ladder mesh; `Climb_Ladder` frames 0–23 are the looped stroke, 23–57 the climb-over |
+| `cutscene` | Letterboxed dialogue scenes: `Cutscene::play(id, lines)`, `finished(id)`; lines are voice keys (`C02-1_GIHMI_01G`), subtitles from the string table; participants get `InScene` (AI skips them) |
+| `tie` | 47's tie: the template's `Tie` (class 0x2000FF, simulated in the original) hung from his chest bone at rest, on a damped spring |
 | `collision`, `nav` | Triangle soup with surfaces; a navigation grid cached in `data/cache/nav_C02-1_v{CACHE_VERSION}.bin` |
 | `shot` | Scripted input and screenshots |
 
@@ -81,6 +85,9 @@ cost time.
     `0x8b` at +9 is the `SndRef`), cloth `0x2000F6`.
 - **ZGF:** `<ID>_MAIN.ZGF` holds the compiled `.ppo` scripts, deflated like the GMS. See
   `docs/SCRIPTS.md`.
+- **String table extras:** item descriptions sit one level down (`Item_Key_Master_01` →
+  `FreeText` → `1` → text); `Strings::description(item)` reads them. Voice lines are keyed by
+  their sound names, so a scene's line key is both its voice file and its subtitle.
 - **HUD art:**
   - The level's `.TEX` holds it: `HealthStealth_01a`, `Ammo_01a`, `AmmoBacklight_01a`,
     `OSDBar_*`.
@@ -135,6 +142,10 @@ have `RelaxedVisRange=3000`.
 - A system takes at most 16 parameters; group them in tuples.
 - Spatial audio uses `SpatialScale`; rodio falls off by the inverse square.
 - `Mesh::compute_aabb` is private; read `Mesh::ATTRIBUTE_POSITION` instead.
+- Physics is `bevy_rapier3d` 0.37, the release for Bevy 0.20. Upgrading Bevy means waiting
+  for a matching Rapier release. Ragdoll bodies are top-level entities; `ragdoll::pose_bones`
+  copies them into the skeleton after Rapier's writeback and before transform propagation.
+  A second joint on a body goes on a child entity (see `drag_by_limb`).
 
 ## Testing
 
@@ -165,6 +176,15 @@ have `RelaxedVisRange=3000`.
     that use a texture.
   - `HITMAN_COVERAGE` and `HITMAN_HOLES` show ground coverage and holes.
   - `HITMAN_PROBE` casts a collision ray.
+- **Fly camera:** F1 toggles it only when launched with `HITMAN_FREECAM=1` (a stray F1 from a
+  laptop media key used to detach the camera mid-game).
+- **Outfit tests:** `HITMAN_OUTFIT=Fuchs` (no model swap) triggers the gate, frisk and Bjarkhov
+  scenes at their anchors (logged at load as `anchors:`); `HITMAN_UNARMED` starts without the
+  pistol (to pass the frisk).
+- **Ragdolls:** `HITMAN_KILL="Name@secs"` shoots a character dead at that time;
+  `HITMAN_PHYSICS_DEBUG` draws the physics colliders.
+- **Stealth in tests:** starting 47 right behind a guard while standing in a suit gets him
+  heard and the base alarmed. Add `C@0.1` to `HITMAN_KEYS` (sneak) and `HITMAN_OUTFIT=Soldier`.
 
 Useful places:
 - 47 near the start crates: `46,1,-22`.

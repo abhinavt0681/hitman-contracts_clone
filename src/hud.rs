@@ -13,7 +13,7 @@
 
 use crate::{
     game::{
-        Actor, Item, Mission, Outcome,
+        Actor, Item, Mission, Notice, Outcome,
         weapons::{self, Gunplay},
     },
     player::{OrbitCamera, Player},
@@ -58,6 +58,8 @@ pub fn hud_text(font: &HudFont, size: f32, color: Color) -> (TextFont, TextColor
 }
 
 const PALE: Color = Color::srgb(0.88, 0.9, 0.88);
+const INFO_BLUE: Color = Color::srgb(0.2, 0.55, 1.0);
+const WARNING_RED: Color = Color::srgb(0.9, 0.12, 0.08);
 /// The translucent grey of the bars and the item panel.
 const GLASS: Color = Color::srgba(0.72, 0.76, 0.76, 0.32);
 const GLASS_DARK: Color = Color::srgba(0.08, 0.1, 0.11, 0.35);
@@ -96,9 +98,23 @@ enum HudLine {
     Carried,
     Extra,
     Prompt,
-    Messages,
+    /// The notice bar's heading ("INFORMATION" / "WARNING") and message.
+    NoticeTitle,
+    NoticeText,
+    /// The item just picked up: its name and description.
+    PickupTitle,
+    PickupText,
+    Subtitle,
     Outcome,
 }
+
+/// The notice bar across the top and its icon.
+#[derive(Component)]
+struct NoticeBar;
+#[derive(Component)]
+struct NoticeIcon;
+#[derive(Component)]
+struct PickupBox;
 
 /// A weapon model on the icon stage.
 #[derive(Component)]
@@ -189,7 +205,42 @@ fn spawn_hud(mut commands: Commands, font: Res<HudFont>, mut images: ResMut<Asse
 
     let centred = |top: f32| Node { top: percent(top), width: percent(100.0), ..absolute() };
     commands.spawn((Text::new(""), hud_text(&font, 15.0, Color::srgb(1.0, 0.93, 0.6)), TextLayout::justify(Justify::Center), centred(74.0), HudLine::Prompt));
-    commands.spawn((Text::new(""), hud_text(&font, 14.0, PALE), TextLayout::justify(Justify::Center), centred(14.0), HudLine::Messages));
+    // Notices, as in the original: a dark bar across the top, a blue "!" (red for warnings),
+    // a small heading and the message.
+    commands
+        .spawn((
+            NoticeBar,
+            Node { top: px(26.0), width: percent(100.0), padding: UiRect::new(px(40.0), px(16.0), px(5.0), px(6.0)), column_gap: px(10.0), align_items: AlignItems::Center, display: Display::None, ..absolute() },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.62)),
+        ))
+        .with_children(|bar| {
+            bar.spawn((
+                NoticeIcon,
+                Node { width: px(22.0), height: px(22.0), border: UiRect::all(px(2.0)), justify_content: JustifyContent::Center, align_items: AlignItems::Center, ..default() },
+                BorderColor::all(INFO_BLUE),
+                BackgroundColor(Color::srgb(0.02, 0.18, 0.45)),
+            ))
+            .with_children(|i| {
+                i.spawn((Text::new("!"), hud_text(&font, 13.0, Color::WHITE)));
+            });
+            bar.spawn(Node { flex_direction: FlexDirection::Column, ..default() }).with_children(|c| {
+                c.spawn((Text::new(""), hud_text(&font, 10.0, INFO_BLUE), HudLine::NoticeTitle));
+                c.spawn((Text::new(""), hud_text(&font, 13.0, PALE), HudLine::NoticeText));
+            });
+        });
+    commands.spawn((Text::new(""), hud_text(&font, 14.0, PALE), TextLayout::justify(Justify::Center), centred(86.0), HudLine::Subtitle));
+    // The item just picked up, bottom left above the bars, as in the original.
+    commands
+        .spawn((
+            PickupBox,
+            Node { left: px(16.0), bottom: px(96.0), max_width: px(380.0), flex_direction: FlexDirection::Column, row_gap: px(3.0), padding: UiRect::all(px(8.0)), border: UiRect::bottom(px(1.0)), display: Display::None, ..absolute() },
+            BorderColor::all(EDGE),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.62)),
+        ))
+        .with_children(|b| {
+            b.spawn((Text::new(""), hud_text(&font, 12.0, INFO_BLUE), HudLine::PickupTitle));
+            b.spawn((Text::new(""), hud_text(&font, 11.0, PALE), HudLine::PickupText));
+        });
     commands.spawn((Text::new(""), hud_text(&font, 26.0, Color::WHITE), TextLayout::justify(Justify::Center), centred(38.0), HudLine::Outcome));
 }
 
@@ -285,6 +336,12 @@ fn update_hud(
     mut parts: Query<(&HudPart, &mut Node, &mut BackgroundColor)>,
     mut lines: Query<(&HudLine, &mut Text)>,
     mut icons: Query<(&IconModel, &mut Visibility)>,
+    mut pickup_box: Query<&mut Node, (With<PickupBox>, Without<HudPart>, Without<NoticeBar>)>,
+    (mut bar, mut icon, mut colours): (
+        Query<&mut Node, (With<NoticeBar>, Without<HudPart>, Without<PickupBox>)>,
+        Query<(&mut BorderColor, &mut BackgroundColor), (With<NoticeIcon>, Without<HudPart>)>,
+        Query<(&HudLine, &mut TextColor)>,
+    ),
 ) {
     let health = (mission.health / 100.0).clamp(0.0, 1.0);
     let hunted = actors.iter().any(|a| a.alive && a.alerted);
@@ -335,6 +392,19 @@ fn update_hud(
             *visibility = want;
         }
     }
+    // The newest notice shows; the bar takes the warning's colours for warnings.
+    let notice = mission.messages.iter().rev().find(|m| m.2 != Notice::Speech).map(|m| (m.0.as_str(), m.2));
+    if let Ok(mut node) = bar.single_mut() {
+        node.display = if notice.is_some() && playing { Display::Flex } else { Display::None };
+    }
+    if let Ok(mut node) = pickup_box.single_mut() {
+        node.display = if mission.picked_up.is_some() && playing { Display::Flex } else { Display::None };
+    }
+    if let Ok((mut border, mut fill)) = icon.single_mut() {
+        let warning = matches!(notice, Some((_, Notice::Warning)));
+        *border = BorderColor::all(if warning { WARNING_RED } else { INFO_BLUE });
+        fill.0 = if warning { Color::srgb(0.4, 0.02, 0.0) } else { Color::srgb(0.02, 0.18, 0.45) };
+    }
     for (line, mut t) in &mut lines {
         let s = match line {
             HudLine::ItemName => {
@@ -345,7 +415,15 @@ fn update_hud(
             HudLine::Extra if playing && mission.tnt > 0 => format!("DYNAMITE  x{}", mission.tnt),
             HudLine::Extra => String::new(),
             HudLine::Prompt => mission.prompt.clone().unwrap_or_default(),
-            HudLine::Messages => mission.messages.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>().join("\n"),
+            HudLine::NoticeTitle => match notice {
+                Some((_, Notice::Warning)) => "WARNING".to_owned(),
+                Some(_) => "INFORMATION".to_owned(),
+                None => String::new(),
+            },
+            HudLine::NoticeText => notice.map_or(String::new(), |(m, _)| m.to_uppercase()),
+            HudLine::PickupTitle => mission.picked_up.as_ref().map_or(String::new(), |p| p.0.to_uppercase()),
+            HudLine::PickupText => mission.picked_up.as_ref().map_or(String::new(), |p| p.1.clone()),
+            HudLine::Subtitle => mission.messages.iter().filter(|m| m.2 == Notice::Speech).map(|m| m.0.as_str()).collect::<Vec<_>>().join("\n"),
             HudLine::Outcome => match mission.outcome {
                 Some(Outcome::Complete) => format!(
                     "MISSION COMPLETE\nRating: {}\nTime {:.0}:{:02.0}\n\nEnter to play again",
@@ -359,6 +437,11 @@ fn update_hud(
         };
         if t.0 != s {
             t.0 = s;
+        }
+    }
+    for (line, mut colour) in &mut colours {
+        if matches!(line, HudLine::NoticeTitle) {
+            colour.0 = if matches!(notice, Some((_, Notice::Warning))) { WARNING_RED } else { INFO_BLUE };
         }
     }
 }

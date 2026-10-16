@@ -5,25 +5,30 @@
 //! Controls (47): click to capture the mouse, Esc to release, WASD to walk, Shift to run,
 //! E to interact (fiber wire from behind, take an outfit, pick up / place dynamite, exit),
 //! left click to fire the silenced pistol.
-//! F1 toggles the debug fly camera: right mouse / M to capture, WASD + E/Q, Shift fast,
+//! Bodies are ragdolls (`ragdoll`, on Rapier).
+//! F1 toggles the debug fly camera (only with `HITMAN_FREECAM=1`): right mouse / M to capture, WASD + E/Q, Shift fast,
 //! scroll for speed.
 
 mod ambience;
 mod atmosphere;
 mod audio;
 mod character;
+mod cutscene;
 mod cloth;
 mod collision;
 mod flow;
 mod footsteps;
 mod game;
 mod hud;
+mod ladder;
 mod map;
 mod music;
 mod nav;
 mod player;
+mod ragdoll;
 mod shot;
 mod snow;
+mod tie;
 mod view;
 
 use bevy::{
@@ -42,7 +47,7 @@ fn main() {
             ..default()
         }))
         .add_plugins((atmosphere::AtmospherePlugin, ambience::AmbiencePlugin, footsteps::FootstepsPlugin, snow::SnowPlugin, cloth::ClothPlugin, nav::NavPlugin, music::MusicPlugin))
-        .add_plugins((FreeCameraPlugin, flow::FlowPlugin, map::MapPlugin, player::PlayerPlugin, character::CharacterPlugin, game::GamePlugin, hud::HudPlugin, shot::ShotPlugin))
+        .add_plugins((FreeCameraPlugin, flow::FlowPlugin, map::MapPlugin, player::PlayerPlugin, character::CharacterPlugin, game::GamePlugin, hud::HudPlugin, shot::ShotPlugin, ragdoll::RagdollPlugin, ladder::LadderPlugin, cutscene::CutscenePlugin, tie::TiePlugin))
         .init_resource::<collision::WorldCollision>()
         .add_systems(Startup, (load_level, audio::setup_audio))
         .add_systems(Update, audio::ambience)
@@ -117,6 +122,45 @@ fn load_level(
     let root = player::spawn(&mut commands, cast.meshes, cast.materials, start + Vec3::Y * 0.1, model.as_ref().map(|(t, _)| *t));
     if let Some((_, m)) = &model {
         character::attach(&mut commands, root, m, &mut cast);
+        // His tie: its own object in the template, hung on his chest (`tie`).
+        let tie = hitman.and_then(|_| {
+            let e = level.entities.iter().find(|e| e.name == "Tie" && e.type_id == 0x2000ff)?;
+            // Its offset from the 47 template it belongs to (the nearest `Hitman2`).
+            let d = |a: [f32; 3]| (a[0] - e.position[0]).powi(2) + (a[1] - e.position[1]).powi(2) + (a[2] - e.position[2]).powi(2);
+            let template = level.entities.iter().filter(|t| t.name == "Hitman2" && t.position != [0.0; 3]).min_by(|a, b| d(a.position).total_cmp(&d(b.position)))?;
+            let sm = level.prm.model(e.primitive).ok()?.submeshes.into_iter().find(|s| s.in_lod0() && !s.is_proxy())?;
+            let offset = [e.position[0] - template.position[0], e.position[1] - template.position[1], e.position[2] - template.position[2]];
+            let (top, bottom) = sm.vertices.iter().fold((f32::MIN, f32::MAX), |(t, b), v| (t.max(v.pos[1]), b.min(v.pos[1])));
+            let mean_of = |sel: &dyn Fn(f32) -> bool| {
+                let vs: Vec<Vec3> = sm.vertices.iter().filter(|v| sel(v.pos[1])).map(|v| Vec3::from(view::swap_xz(v.pos))).collect();
+                vs.iter().copied().sum::<Vec3>() / vs.len().max(1) as f32
+            };
+            let (knot, tip) = (mean_of(&|y| y > top - 2.0), mean_of(&|y| y < bottom + 2.0));
+            // The original simulates the tie: it's authored jutting out at 45° from the knot,
+            // and gravity and three collision planes lay it on his shirt. Hang it at rest
+            // instead, from the knot: as high as the template places it, as far in front of his
+            // centre line, down and a little forward over his chest, its flat face to the front.
+            // His front, side and up in the model's space (centimetres), from the model's own
+            // transform (the player faces −Z).
+            let to_model = model.as_ref()?.0.to_matrix().inverse();
+            let (front, side, up) = [Vec3::NEG_Z, Vec3::X, Vec3::Y].map(|v| to_model.transform_vector3(v).normalize()).into();
+            let knot_in_model = up * (offset[1] + knot.y) + front * (knot.with_y(0.0).length() + KNOT_OUT);
+            let frame = |length: Vec3, width: Vec3| {
+                let a = length.normalize();
+                let b = (width - a * width.dot(a)).normalize();
+                Mat3::from_cols(a, b, a.cross(b))
+            };
+            // In the mesh the tie is 6 cm wide along its (swapped) Z.
+            let from = frame(tip - knot, Vec3::Z);
+            let to = frame(-up + front * TIE_LEAN, side);
+            let in_model = Mat4::from_translation(knot_in_model) * Mat4::from_mat3(to * from.transpose()) * Mat4::from_translation(-knot);
+            let material = view::build_material(&level.tex, view::MaterialKey { texture: sm.texture, blended: sm.blended }, cast.images);
+            Some(tie::TieModel { mesh: cast.meshes.add(view::build_mesh(&sm)), material: cast.materials.add(material), in_model, knot })
+        });
+        match tie {
+            Some(t) => commands.insert_resource(t),
+            None => warn!("47's tie not found in the level"),
+        }
         if let Some(set) = lib.set_index("Hero.anm") {
             let idle = lib.first_of(set, &["Stand_Do_Nothing", "Stand_Relaxed"]).unwrap_or_default();
             commands.entity(root).insert((character::Gait::new(&lib, set, idle.clone()), character::Animator::new(set, idle)));
@@ -124,6 +168,22 @@ fn load_level(
     }
     let mut wardrobe = build_wardrobe(&level);
     wardrobe.0.extend(actor_models);
+    // His own suit, to change back into from the bundle he leaves (`game::bundle`).
+    if let Some((_, m)) = &model {
+        wardrobe.0.insert(game::bundle::SUIT.to_owned(), m.clone());
+    }
+    // The folded suit itself: `Bundle_01` under `CB_Hitman2`.
+    if let Some(b) = level.entities.iter().find(|e| e.name == "Bundle_01" && e.primitive != 0) {
+        if let Ok(m) = level.prm.model(b.primitive) {
+            let parts = m
+                .submeshes
+                .iter()
+                .filter(|s| s.in_lod0() && !s.is_proxy())
+                .map(|s| (meshes.add(view::build_mesh(s)), materials.add(view::build_material(&level.tex, view::MaterialKey { texture: s.texture, blended: s.blended }, &mut images))))
+                .collect();
+            commands.insert_resource(game::bundle::SuitBundleModel { parts, transform: view::instance_transform(b.rotation, [0.0; 3]) });
+        }
+    }
     info!("wardrobe: {:?}", wardrobe.0.keys().collect::<Vec<_>>());
     commands.insert_resource(wardrobe);
     commands.insert_resource(find_anchors(&level));
@@ -139,6 +199,7 @@ fn load_level(
     ));
     atmosphere::spawn(&level, &bounds, &collision, &mut commands);
     ambience::spawn(&level, &bounds.entity_world, &mut commands);
+    commands.insert_resource(ladder::build(&bounds.ladder_guides, &collision));
     commands.insert_resource(bounds);
     commands.insert_resource(view::EntityNames(level.entities.iter().map(|e| e.name.clone()).collect()));
     commands.insert_resource(game::Text(std::mem::take(&mut level.strings)));
@@ -196,6 +257,7 @@ fn find_anchors(level: &glacier::level::Level) -> game::Anchors {
     let bjarkhov_office = require(&["BjarkhovOffice", "CommanderBjarkhov_01"]);
     let bjarkhov_desk = require(&["GreetFuchsLoc"]);
     let ship_gangway = require(&["FuchsComing_triggerbox"]);
+    info!("anchors: suit {radiation_suit:.1?}, gangway {ship_gangway:.1?}, office {bjarkhov_office:.1?}, frisk {:.1?}", ["FriskHitman_triggerbox", "FriskHitman_triggerbox#01"].iter().filter_map(|n| at(n)).collect::<Vec<_>>());
     game::Anchors {
         tnt,
         bomb_sites,
@@ -212,6 +274,7 @@ fn find_anchors(level: &glacier::level::Level) -> game::Anchors {
         bjarkhov_office,
         bjarkhov_desk,
         ship_gangway,
+        frisk: ["FriskHitman_triggerbox", "FriskHitman_triggerbox#01"].iter().filter_map(|n| at(n)).collect(),
     }
 }
 
@@ -229,6 +292,11 @@ fn patrol_route(level: &glacier::level::Level, actor: &glacier::gms::Entity) -> 
         .map(|n| (view::glacier_to_bevy(n.position), if n.name.contains("Wait") { 4.0 } else { 0.0 }))
         .collect()
 }
+
+/// 47's tie at rest: the knot this far (cm) further out than the template has it, and the tie
+/// leaning forward by this much per unit of drop, so it lies on his shirt instead of inside it.
+const KNOT_OUT: f32 = 2.0;
+const TIE_LEAN: f32 = 0.44;
 
 fn spawn_actors(
     level: &glacier::level::Level,

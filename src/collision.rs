@@ -98,6 +98,11 @@ impl WorldCollision {
         }
     }
 
+    /// Every triangle, in world space.
+    pub fn triangles(&self) -> &[[Vec3; 3]] {
+        &self.tris
+    }
+
     pub fn len(&self) -> usize {
         self.tris.len()
     }

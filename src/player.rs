@@ -1,7 +1,7 @@
 //! Agent 47: third-person movement over the static level collision.
 //!
 //! Controls: WASD move (walk), Shift run, mouse orbit (click to capture, Esc to release),
-//! F1 toggles between 47 and the free-fly debug camera.
+//! F1 toggles between 47 and the free-fly debug camera, when launched with `HITMAN_FREECAM=1`.
 
 use crate::collision::WorldCollision;
 use bevy::{
@@ -30,6 +30,10 @@ const AIM_SHOULDER: f32 = 0.35;
 const AIM_DISTANCE: f32 = 1.6;
 const FOV: f32 = std::f32::consts::FRAC_PI_4;
 const AIM_FOV: f32 = 0.55;
+/// The spring arm counts as cramped below this share of its length…
+const CRAMPED: f32 = 0.55;
+/// …and the camera then rises up to this far (m) to look down on 47.
+const CRAMP_RISE: f32 = 2.4;
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 
 pub struct PlayerPlugin;
@@ -133,7 +137,9 @@ pub fn orbit_camera() -> OrbitCamera {
 }
 
 fn toggle_mode(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>, cam: Query<(Entity, Has<FreeCamera>), With<OrbitCamera>>) {
-    if !keys.just_pressed(KeyCode::F1) {
+    // A debug tool, opt-in: on many laptops F1 doubles as a media key, and an accidental press
+    // left the camera flying free of 47 mid-game.
+    if !keys.just_pressed(KeyCode::F1) || std::env::var_os("HITMAN_FREECAM").is_none() {
         return;
     }
     let Ok((id, flying)) = cam.single() else { return };
@@ -178,7 +184,8 @@ fn move_player(
     keys: Res<ButtonInput<KeyCode>>,
     world: Res<WorldCollision>,
     cam: Query<&OrbitCamera>,
-    mut player: Query<(&mut Transform, &mut Player)>,
+    // On a ladder, `ladder::climb` moves him instead.
+    mut player: Query<(&mut Transform, &mut Player), Without<crate::ladder::Climbing>>,
     mut gaits: Query<&mut crate::character::Gait>,
     mission: Option<Res<crate::game::Mission>>,
 ) {
@@ -297,10 +304,19 @@ fn move_player(
 
 fn follow_camera(
     world: Res<WorldCollision>,
+    scene: Option<Res<crate::cutscene::SceneCamera>>,
     player: Query<(&Transform, &Player), Without<OrbitCamera>>,
     mut cam: Query<(&mut Transform, &OrbitCamera, &mut Projection)>,
 ) {
     let (Ok((pt, p)), Ok((mut ct, orbit, mut projection))) = (player.single(), cam.single_mut()) else { return };
+    // A dialogue scene frames its own shots.
+    if let Some(shot) = scene.as_ref().and_then(|s| s.0) {
+        *ct = shot;
+        if let Projection::Perspective(persp) = &mut *projection {
+            persp.fov = FOV;
+        }
+        return;
+    }
     let rot = Quat::from_euler(EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
     let eye_h = if p.crouching { CROUCH_EYE_HEIGHT } else { EYE_HEIGHT };
     // Aiming pulls the camera in over the right shoulder and narrows the view.
@@ -314,6 +330,12 @@ fn follow_camera(
     let back = rot * Vec3::Z;
     // Spring arm: pull in when level geometry is between 47 and the camera.
     let dist = world.raycast(pivot, back, distance).map_or(distance, |h| (h.distance - 0.2).max(0.3));
-    ct.translation = pivot + back * dist;
-    ct.rotation = rot;
+    // Cramped (a shaft, a toilet stall, a corridor corner): like the original, rise into the
+    // headroom and look down on 47 instead of pressing against his back.
+    let cramp = if orbit.aim > 0.5 { 0.0 } else { (1.0 - dist / (distance * CRAMPED)).clamp(0.0, 1.0) };
+    let headroom = world.raycast(pivot, Vec3::Y, CRAMP_RISE + 0.3).map_or(CRAMP_RISE, |h| (h.distance - 0.3).max(0.0));
+    let lift = headroom.min(CRAMP_RISE) * cramp;
+    ct.translation = pivot + back * dist + Vec3::Y * lift;
+    let down = Transform::from_translation(ct.translation).looking_at(pt.translation + Vec3::Y * eye_h * 0.7, Vec3::Y).rotation;
+    ct.rotation = rot.slerp(down, cramp);
 }

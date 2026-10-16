@@ -30,7 +30,6 @@ pub struct SoundBank {
     pub osd_warning: Handle<AudioSource>,
     #[allow(dead_code)]
     pub key_pick_lock: Handle<AudioSource>,
-    pub bjarkhov_welcome: Handle<AudioSource>,
     pub bjarkhov_drink_vodka: Handle<AudioSource>,
     pub base_alarm: Handle<AudioSource>,
     pub rifle_shot: Handle<AudioSource>,
@@ -41,6 +40,9 @@ pub struct SoundBank {
     pub pistol_clip_in: Handle<AudioSource>,
     pub pistol_chamber: Handle<AudioSource>,
     pub empty_click: Handle<AudioSource>,
+    pub pickup_rifle: Handle<AudioSource>,
+    pub drop_gun: Handle<AudioSource>,
+    pub drop_rifle: Handle<AudioSource>,
     pub pickup_gun: Handle<AudioSource>,
     /// Bullet impacts by surface, and in flesh.
     pub impacts: std::collections::HashMap<crate::collision::Surface, Vec<Handle<AudioSource>>>,
@@ -52,6 +54,8 @@ pub struct SoundBank {
     pub steps: std::collections::HashMap<crate::collision::Surface, Vec<Handle<AudioSource>>>,
     /// Diana's briefing lines, by `.LOC` key (`flow::DIANA`).
     pub voices: std::collections::HashMap<&'static str, Handle<AudioSource>>,
+    /// Dialogue lines for scenes (`cutscene::LINES`), with their length in seconds.
+    pub lines: std::collections::HashMap<&'static str, (Handle<AudioSource>, f32)>,
     /// What the level's sound emitters play, by bank name (`ambience::VOICES`).
     pub ambient: std::collections::HashMap<&'static str, Handle<AudioSource>>,
 }
@@ -84,11 +88,15 @@ pub fn setup_audio(mut commands: Commands, mut audio_assets: ResMut<Assets<Audio
             None
         }
     };
+    let mut lengths: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
     let mut load = |name: &str| -> Handle<AudioSource> {
         let bytes = archive.as_ref().and_then(|a| a.decode(&format!("{name}.wav"))).unwrap_or_else(|| {
             warn!("sound {name} not found in the {id} bank");
             Vec::new()
         });
+        if let Some(secs) = wav_seconds(&bytes) {
+            lengths.insert(name.to_owned(), secs);
+        }
         audio_assets.add(AudioSource { bytes: bytes.into() })
     };
     let bank = SoundBank {
@@ -115,8 +123,6 @@ pub fn setup_audio(mut commands: Commands, mut audio_assets: ResMut<Assets<Audio
         osd_hint: load("OSD_Ingame_Hint_01"),
         osd_warning: load("OSD_Ingame_Warning_01"),
         key_pick_lock: load("Key_PickLock_01"),
-        // "So good to meet you at last Fabian… We shall have some vodka."
-        bjarkhov_welcome: load("C02-1_BGHM_01CB"),
         // "Nostrovya!"
         bjarkhov_drink_vodka: load("C02-1_B_01CB"),
         // "Alarm. Get to your posts. We have an intruder. Alarm."
@@ -130,6 +136,9 @@ pub fn setup_audio(mut commands: Commands, mut audio_assets: ResMut<Assets<Audio
         pistol_chamber: load("W_HardBaller_Chamber_01"),
         empty_click: load("W_Empty_01"),
         pickup_gun: load("PickUp_Gun_01"),
+        pickup_rifle: load("PickUp_Rifle_01"),
+        drop_gun: load("Drop_Gun_02"),
+        drop_rifle: load("Drop_Rifle_01"),
         impacts: {
             use crate::collision::Surface::*;
             [(Snow, "Snow", 6), (Gravel, "Gravel", 6), (Concrete, "Stone", 6), (Steel, "Metal", 7), (Wood, "Wood", 4), (Carpet, "Cloth", 3), (Water, "Water", 4), (Dirt, "Gravel", 6)]
@@ -149,7 +158,11 @@ pub fn setup_audio(mut commands: Commands, mut audio_assets: ResMut<Assets<Audio
         },
         voices: crate::flow::DIANA.iter().map(|&k| (k, load(k))).collect(),
         ambient: crate::ambience::VOICES.iter().map(|v| (v.sound, load(v.sound))).collect(),
+        lines: std::collections::HashMap::new(),
     };
+    let mut bank = bank;
+    let line_handles: Vec<(&'static str, Handle<AudioSource>)> = crate::cutscene::LINES.iter().map(|&k| (k, load(k))).collect();
+    bank.lines = line_handles.into_iter().map(|(k, h)| (k, (h, lengths.get(k).copied().unwrap_or(3.0)))).collect();
 
     // The blizzard never stops.
     commands.spawn((AudioPlayer::new(bank.wind.clone()), PlaybackSettings::LOOP.with_volume(Volume::Linear(WIND_VOLUME)), WindLoop));
@@ -179,4 +192,23 @@ pub fn ambience(mut commands: Commands, time: Res<Time>, bank: Option<Res<SoundB
         play_sound(&mut commands, &bank.fog_horn, 0.25);
         amb.next_horn = 55.0;
     }
+}
+
+/// Length of a RIFF/WAVE file in seconds (its data size over its byte rate).
+fn wav_seconds(bytes: &[u8]) -> Option<f32> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let (mut at, mut byte_rate) = (12, None);
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
+        match id {
+            b"fmt " if at + 20 <= bytes.len() => byte_rate = Some(u32::from_le_bytes(bytes[at + 16..at + 20].try_into().ok()?)),
+            b"data" => return byte_rate.filter(|&r| r > 0).map(|r| size as f32 / r as f32),
+            _ => {}
+        }
+        at += 8 + size + (size & 1);
+    }
+    None
 }

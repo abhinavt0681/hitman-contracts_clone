@@ -43,7 +43,10 @@ pub(super) fn player_actions(
 ) {
     let (keys, mouse_scroll) = (&inputs.0, &inputs.1);
     // Weapon / Item switching with keys 1..=5 and mouse wheel
-    let mut items = vec![Item::Holstered, Item::FiberWire, Item::SilencedPistol, Item::PoisonVial, Item::BombRemote];
+    let mut items = vec![Item::Holstered, Item::FiberWire, Item::PoisonVial, Item::BombRemote];
+    if mission.carrying_pistol {
+        items.insert(2, Item::SilencedPistol);
+    }
     if mission.rifle.is_some() {
         items.push(Item::AssaultRifle);
     }
@@ -51,7 +54,7 @@ pub(super) fn player_actions(
         Some(Item::Holstered)
     } else if keys.just_pressed(KeyCode::Digit2) {
         Some(Item::FiberWire)
-    } else if keys.just_pressed(KeyCode::Digit3) {
+    } else if keys.just_pressed(KeyCode::Digit3) && mission.carrying_pistol {
         Some(Item::SilencedPistol)
     } else if keys.just_pressed(KeyCode::Digit4) {
         Some(Item::PoisonVial)
@@ -80,8 +83,6 @@ pub(super) fn player_actions(
     if let Some(item) = switch {
         if item != mission.active_item {
             mission.active_item = item;
-            let label = item.label();
-            mission.say(format!("Equipped: {label}"));
             if let Some(sb) = &sound_bank {
                 if item == Item::Holstered {
                     crate::audio::play_sound(&mut commands, &sb.gun_holster, 0.5);
@@ -106,7 +107,6 @@ pub(super) fn player_actions(
         mission.prompt = Some("[G] Drop body".to_owned());
         if keys.just_pressed(KeyCode::KeyG) {
             mission.dragging_body = None;
-            mission.say("Body dropped");
             mission.noises.push((me, BODY_DROP_HEARING));
             if let Some(sb) = &sound_bank {
                 crate::audio::play_sound(&mut commands, &sb.body_drop, 0.6);
@@ -196,7 +196,7 @@ pub(super) fn player_actions(
                 }
                 ammo.spare += weapons::AK47.magazine;
                 mission.active_item = Item::AssaultRifle;
-                mission.say("Took the AK-47 [6]");
+                mission.picked_up(&text, "Rifle_AK47_01", "AK-47");
                 if let Ok((_, _, mut a, _)) = actors.get_mut(e) {
                     a.disarmed = true;
                 }
@@ -208,7 +208,6 @@ pub(super) fn player_actions(
 
             if keys.just_pressed(KeyCode::KeyG) {
                 mission.dragging_body = Some(e);
-                mission.say("Dragging body (press G to drop)");
                 if let Some(sb) = &sound_bank {
                     crate::audio::play_sound(&mut commands, &sb.body_drag, 0.6);
                 }
@@ -289,7 +288,6 @@ pub(super) fn player_actions(
                     };
                     crate::audio::play_sound(&mut commands, snd, 0.65);
                 }
-                mission.say(if door.is_open { "Door opened" } else { "Door closed" });
                 return;
             }
         }
@@ -373,7 +371,7 @@ pub(super) fn player_actions(
         if use_key {
             anchors.tnt[i].1 = true;
             mission.tnt += 1;
-            mission.say("Picked up dynamite");
+            mission.picked_up(&text, "Dynamite", "Dynamite");
             if let Some(sb) = &sound_bank {
                 crate::audio::play_sound(&mut commands, &sb.gun_pull, 0.4);
             }
@@ -426,7 +424,8 @@ pub(super) fn update_dragged_body(
     sound_bank: Option<Res<crate::audio::SoundBank>>,
     mut mission: ResMut<Mission>,
     player: Query<(&GlobalTransform, &Player)>,
-    mut actors: Query<(&mut Transform, &Actor)>,
+    // Ragdolls are dragged by a limb instead (`ragdoll::drag_by_limb`).
+    mut actors: Query<(&mut Transform, &Actor), Without<crate::ragdoll::Ragdoll>>,
 ) {
     let Some(drag_entity) = mission.dragging_body else { return };
     let dt = time.delta_secs();
@@ -480,7 +479,7 @@ pub(super) fn shoot(
 
     if mission.active_item == Item::BombRemote {
         if mission.sub_bombs_placed < 3 {
-            mission.say("Need to place all 3 bombs on submarine before detonation");
+            mission.warn("Need to place all 3 bombs on submarine before detonation");
         } else if !mission.objectives[2].done {
             if let Some(sb) = &sound_bank {
                 crate::audio::play_sound(&mut commands, &sb.sub_explode, 1.0);
@@ -491,7 +490,7 @@ pub(super) fn shoot(
             if let Ok(pt) = player.single() {
                 if pt.translation().distance(anchors.sub.0) < 22.0 {
                     mission.health -= 60.0;
-                    mission.say("You were caught in the explosion blast!");
+                    mission.warn("You were caught in the explosion blast!");
                 }
             }
             for (e, gt, mut a, mut anim) in &mut actors {

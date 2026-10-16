@@ -25,6 +25,8 @@ const PLANT: f32 = 0.025;
 const LIFT: f32 = 0.06;
 /// Others' steps are only played within this distance of the camera.
 const HEARD_WITHIN: f32 = 25.0;
+/// Snow steps under the wind: barely there, as in the original.
+const SNOW_GAIN: f32 = 0.25;
 
 pub struct FootstepsPlugin;
 
@@ -92,17 +94,22 @@ fn step(
             let sound = sounds[feet.variant % sounds.len()].clone();
             let running = gait.speed > 2.6;
             debug!("step {:?} foot {k} on {surface:?} at speed {:.1}", e, gait.speed);
+            // Levels measured against gameplay footage of the original: indoors a step is only
+            // ~1.5–3 dB over the room (played at about a tenth of full scale); outdoors the
+            // blizzard buries them completely, with no footfall rhythm left in the audio.
+            let surface_gain = if surface == crate::collision::Surface::Snow { SNOW_GAIN } else { 1.0 };
             if Some(e) == me {
-                let volume = if gait.crouching {
-                    0.08
-                } else if running {
-                    0.5
-                } else {
-                    0.28
-                };
+                let volume = surface_gain
+                    * if gait.crouching {
+                        0.03
+                    } else if running {
+                        0.17
+                    } else {
+                        0.11
+                    };
                 commands.spawn((AudioPlayer::new(sound), PlaybackSettings::DESPAWN.with_volume(Volume::Linear(volume))));
             } else if ear.is_some_and(|ear| ear.distance(base) < HEARD_WITHIN) {
-                let volume = if running { 0.7 } else { 0.4 };
+                let volume = surface_gain * if running { 0.35 } else { 0.2 };
                 commands.spawn((
                     AudioPlayer::new(sound),
                     PlaybackSettings::DESPAWN.with_spatial(true).with_spatial_scale(SpatialScale::new(1.0 / 3.0)).with_volume(Volume::Linear(volume)),

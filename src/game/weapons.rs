@@ -271,7 +271,8 @@ pub(super) fn wound(
         actor.alive = false;
         let clip = lib.first_of(anim.set(), &["Die_Backward", "Die_Forward"]).unwrap_or_default();
         anim.play_once(&clip);
-        commands.entity(target).remove::<Gait>();
+        // The round knocks him down: he goes limp at once (`ragdoll`).
+        commands.entity(target).remove::<Gait>().insert(crate::ragdoll::Shot { at, impulse: (at - shooter).normalize_or_zero() * crate::ragdoll::SHOT_PUSH });
         if let Some(s) = bank.and_then(|b| pick(&b.death_cries, rng)) {
             play_at(commands, s, at, 0.8, 4.0);
         }
@@ -675,3 +676,113 @@ pub(super) fn hold_models(
     }
 }
 
+
+/// A gun 47 put down (X), where he left it, with its rounds.
+#[derive(Component)]
+pub(super) struct DroppedGun {
+    item: Item,
+    ammo: Ammo,
+}
+
+/// X puts the gun in hand on the ground (before a frisk, say); E picks it up again.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drop_and_pick_up(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    models: Option<Res<crate::view::WeaponModels>>,
+    meshes: Res<Assets<Mesh>>,
+    bank: Option<Res<SoundBank>>,
+    text: Res<Text>,
+    mut mission: ResMut<Mission>,
+    player: Query<&GlobalTransform, With<Player>>,
+    guns: Query<(Entity, &GlobalTransform, &DroppedGun)>,
+) {
+    if mission.busy > 0.0 || mission.outcome.is_some() {
+        return;
+    }
+    let Ok(pt) = player.single() else { return };
+    let me = pt.translation();
+    if keys.just_pressed(KeyCode::KeyX) {
+        let item = mission.active_item;
+        let ammo = match item {
+            Item::SilencedPistol if mission.carrying_pistol => {
+                mission.carrying_pistol = false;
+                Some(mission.pistol)
+            }
+            Item::AssaultRifle => mission.rifle.take(),
+            _ => None,
+        };
+        let Some(ammo) = ammo else { return };
+        mission.active_item = Item::Holstered;
+        let fwd = (pt.rotation() * Vec3::NEG_Z).with_y(0.0).normalize_or_zero();
+        let at = me + fwd * 0.5;
+        let holder = commands.spawn((DroppedGun { item, ammo }, Transform::from_translation(at), Visibility::Inherited, Name::new(format!("Dropped {item:?}")))).id();
+        if let Some(model) = model_for(item).and_then(|n| models.as_ref()?.0.get(n)) {
+            let (rotation, lift) = lay_flat(model, &meshes);
+            commands.entity(holder).insert(Transform::from_translation(at + Vec3::Y * lift).with_rotation(Quat::from_rotation_y(pt.rotation().to_euler(EulerRot::YXZ).0) * rotation));
+            for (mesh, material, t) in &model.parts {
+                let part = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), *t)).id();
+                commands.entity(holder).add_child(part);
+            }
+        }
+        if let Some(b) = &bank {
+            crate::audio::play_sound(&mut commands, if item == Item::AssaultRifle { &b.drop_rifle } else { &b.drop_gun }, 0.6);
+        }
+        return;
+    }
+    if mission.prompt.is_some() {
+        return;
+    }
+    let Some((e, gun)) = guns
+        .iter()
+        .map(|(e, t, g)| (e, g, t.translation().with_y(0.0).distance(me.with_y(0.0))))
+        .filter(|(_, _, d)| *d < 1.3)
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(e, g, _)| (e, g))
+    else {
+        return;
+    };
+    let name = if gun.item == Item::AssaultRifle { "AK-47" } else { "Silverballer" };
+    mission.prompt = Some(format!("[E] Pick up the {name}"));
+    if keys.just_pressed(KeyCode::KeyE) {
+        match gun.item {
+            Item::SilencedPistol => {
+                mission.carrying_pistol = true;
+                mission.pistol = gun.ammo;
+            }
+            _ => match mission.rifle.as_mut() {
+                Some(r) => r.spare += gun.ammo.loaded + gun.ammo.spare,
+                None => mission.rifle = Some(gun.ammo),
+            },
+        }
+        mission.active_item = gun.item;
+        mission.picked_up(&text, if gun.item == Item::AssaultRifle { "Rifle_AK47_01" } else { "Gun_Hardballer_Silenced_01" }, name);
+        commands.entity(e).despawn();
+        if let Some(b) = &bank {
+            crate::audio::play_sound(&mut commands, if gun.item == Item::AssaultRifle { &b.pickup_rifle } else { &b.pickup_gun }, 0.6);
+        }
+    }
+}
+
+/// Turns a weapon model to lie flat (its thinnest axis up, longest along X) and how high to
+/// lift it to rest on the floor.
+fn lay_flat(model: &crate::view::WeaponModel, meshes: &Assets<Mesh>) -> (Quat, f32) {
+    let (mut lo, mut hi) = (Vec3::MAX, Vec3::MIN);
+    for (mesh, _, t) in &model.parts {
+        let Some(positions) = meshes.get(mesh).and_then(|m| m.attribute(Mesh::ATTRIBUTE_POSITION)).and_then(|a| a.as_float3()) else { continue };
+        for p in positions {
+            let p = t.transform_point(Vec3::from(*p));
+            (lo, hi) = (lo.min(p), hi.max(p));
+        }
+    }
+    if lo.x > hi.x {
+        return (Quat::IDENTITY, 0.02);
+    }
+    let size = hi - lo;
+    let mut axes = [(size.x, Vec3::X), (size.y, Vec3::Y), (size.z, Vec3::Z)];
+    axes.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let (long, mid, thin) = (axes[0].1, axes[1].1, axes[2].1);
+    // Model axes → world: long → X, thin → Y (up), mid → Z; keep it a proper rotation.
+    let m = Mat3::from_cols(long, thin, if long.cross(thin).dot(mid) > 0.0 { mid } else { -mid });
+    (Quat::from_mat3(&m.transpose()), axes[2].0 * 0.5 + 0.01)
+}
